@@ -342,6 +342,8 @@ pub enum BoltState {
     Defunct,
 }
 
+pub enum ResponseType { Success, Failure }
+
 impl BoltState {
     /// Given current state + request type + response type, return next state.
     /// Returns Err if the transition is invalid (protocol violation).
@@ -350,6 +352,29 @@ impl BoltState {
         request: &BoltRequest,
         response_type: ResponseType,
     ) -> Result<BoltState, BoltProtocolError>;
+
+    /// Handle the <INTERRUPT> signal (triggered by RESET arrival).
+    /// This is separate from message processing — it fires immediately.
+    pub fn interrupt(&self) -> Result<BoltState, BoltProtocolError> {
+        match self {
+            Ready | Streaming | TxReady | TxStreaming
+            | Failed | Interrupted => Ok(Interrupted),
+            // Cannot interrupt during Negotiation/Authentication
+            _ => Err(BoltProtocolError::InvalidInterrupt),
+        }
+    }
+
+    /// Check if a message should be IGNORED in the current state.
+    /// In INTERRUPTED state, everything except RESET and GOODBYE is ignored.
+    /// In FAILED state, everything except RESET, ROLLBACK, and GOODBYE is ignored.
+    pub fn should_ignore(&self, request: &BoltRequest) -> bool {
+        match self {
+            Interrupted => !matches!(request, BoltRequest::Reset | BoltRequest::Goodbye),
+            Failed => !matches!(request,
+                BoltRequest::Reset | BoltRequest::Rollback | BoltRequest::Goodbye),
+            _ => false,
+        }
+    }
 }
 ```
 
@@ -473,6 +498,7 @@ pub struct BoltConnection {
     chunk_decoder: ChunkDecoder,
     writer: PackStreamWriter,
     user_data: *mut c_void,  // Opaque pointer for host app (e.g., RedisModuleCtx)
+    interrupt_flag: Arc<InterruptFlag>,  // Shared with execution thread for RESET
 }
 
 impl BoltConnection {
@@ -498,11 +524,20 @@ impl BoltConnection {
     pub fn feed_data(&mut self, data: &[u8]) -> Result<Vec<BoltRequest>, BoltError>;
 
     /// Process a single request through the handler, updating state.
+    /// If state is INTERRUPTED, all messages except RESET/GOODBYE get IGNORED.
+    /// If state is FAILED, all messages except RESET/ROLLBACK/GOODBYE get IGNORED.
     pub fn process_request(
         &mut self,
         request: BoltRequest,
         handler: &dyn BoltHandler,
     ) -> Result<(), BoltError>;
+
+    /// Handle <INTERRUPT> signal (called when RESET arrives, before queued processing).
+    /// Sets interrupt_flag, transitions state to INTERRUPTED.
+    pub fn signal_interrupt(&mut self);
+
+    /// Get the interrupt flag (shared with execution thread).
+    pub fn interrupt_flag(&self) -> Arc<InterruptFlag>;
 
     /// Get/set opaque user data pointer.
     pub fn user_data(&self) -> *mut c_void;
@@ -1597,6 +1632,213 @@ void ErrorCtx_EmitException(void) {
 ```
 
 The change: instead of directly writing FAILURE to the bolt client, call the appropriate buffer/reply function from the Rust crate.
+
+---
+
+### RESET & Interrupted State
+
+RESET is the most complex message in the Bolt protocol. Unlike all other messages, it has **dual behavior**: an out-of-band interrupt signal that jumps ahead in the message queue, and a queued message that recovers the connection to READY.
+
+#### How RESET works (per [Bolt spec](https://neo4j.com/docs/bolt/current/bolt/server-state/))
+
+When a client sends RESET:
+
+1. **`<INTERRUPT>` signal**: On arrival at the server, RESET immediately generates an out-of-band interrupt that:
+   - Stops any currently executing unit of work (e.g., a running query)
+   - Transitions the state machine to **INTERRUPTED** (from any of: READY, STREAMING, TX_READY, TX_STREAMING, FAILED, or INTERRUPTED itself)
+
+2. **Queued RESET message**: The RESET also queues in the normal message pipeline. All messages **ahead** of RESET in the queue are responded to with **IGNORED** and the state stays INTERRUPTED. When the RESET's turn comes:
+   - On success: responds with **SUCCESS {}**, state → **READY**
+   - On failure: responds with **FAILURE {}**, state → **DEFUNCT** (connection closed)
+
+3. **Side effects of successful RESET**:
+   - Any open transaction is rolled back
+   - Any active QueryBuffer is discarded (error + free)
+   - Connection state returns to READY (as if HELLO + LOGON had just completed)
+
+#### State transition table for INTERRUPTED
+
+| Current State | Message | Response | New State |
+|---|---|---|---|
+| INTERRUPTED | RUN | IGNORED | INTERRUPTED |
+| INTERRUPTED | PULL | IGNORED | INTERRUPTED |
+| INTERRUPTED | DISCARD | IGNORED | INTERRUPTED |
+| INTERRUPTED | BEGIN | IGNORED | INTERRUPTED |
+| INTERRUPTED | COMMIT | IGNORED | INTERRUPTED |
+| INTERRUPTED | ROLLBACK | IGNORED | INTERRUPTED |
+| INTERRUPTED | RESET | SUCCESS {} | READY |
+| INTERRUPTED | RESET | FAILURE {} | DEFUNCT |
+| INTERRUPTED | GOODBYE | (disconnect) | DEFUNCT |
+
+#### Implementation in the crate
+
+The key challenge: RESET must **interrupt a running query** that may be executing on a different thread (the graph engine thread), while the RESET arrives on the event loop thread via the socket.
+
+```rust
+/// Per-connection interrupt flag, shared between the event loop and execution thread.
+/// Set by the event loop when RESET arrives; polled by the execution engine.
+pub struct InterruptFlag {
+    interrupted: AtomicBool,
+}
+
+impl InterruptFlag {
+    pub fn set(&self) { self.interrupted.store(true, Ordering::Release); }
+    pub fn clear(&self) { self.interrupted.store(false, Ordering::Release); }
+    pub fn is_set(&self) -> bool { self.interrupted.load(Ordering::Acquire); }
+}
+```
+
+The `BoltConnection` owns an `Arc<InterruptFlag>` which is shared with the execution context:
+
+```rust
+pub struct BoltConnection {
+    state: BoltState,
+    // ...
+    interrupt_flag: Arc<InterruptFlag>,
+    /// Messages queued between <INTERRUPT> signal and RESET processing.
+    /// Each gets an IGNORED response.
+    pending_ignores: u32,
+}
+```
+
+#### Processing flow when RESET arrives
+
+```
+Event loop thread                          Execution thread
+────────────────                           ────────────────
+RESET arrives on socket
+  │
+  ├── 1. Set interrupt_flag (atomic)  ───► execution polls flag
+  │                                        → query aborts early
+  │                                        → bolt_buffer_error(client, ...)
+  │
+  ├── 2. Transition state → INTERRUPTED
+  │
+  ├── 3. Count queued unprocessed messages
+  │      (these will get IGNORED responses)
+  │
+  ├── 4. Process queued messages:
+  │      for each message ahead of RESET:
+  │        → write IGNORED response
+  │        → state stays INTERRUPTED
+  │
+  ├── 5. Process the RESET itself:
+  │      → roll back any open transaction (handler.rollback())
+  │      → discard active QueryBuffer if any
+  │      → clear interrupt_flag
+  │      → write SUCCESS {}
+  │      → state → READY
+  │
+  └── Done. Connection is clean.
+```
+
+#### How the execution engine cooperates
+
+The execution engine (host app) must periodically check the interrupt flag during query execution. This is NOT a new concept — FalkorDB C already has `QueryCtx_GetStatus()` which checks for timeout. The interrupt flag integrates with this:
+
+**In FalkorDB C**:
+```c
+// The interrupt flag pointer is passed to the execution context during RUN
+// In QueryCtx or similar, check periodically:
+bool should_abort = bolt_connection_is_interrupted(client);
+if (should_abort) {
+    // Stop execution, emit error to buffer
+    bolt_buffer_error(client,
+        "Neo.TransientError.Transaction.Terminated",
+        "The transaction has been terminated (RESET)");
+    return;
+}
+```
+
+**In FalkorDB Rust (next-gen)**:
+```rust
+// The Arc<InterruptFlag> is accessible from the Runtime
+// Check during iteration:
+if conn.interrupt_flag.is_set() {
+    return Err(BoltError::interrupted());
+}
+```
+
+#### C FFI additions for interrupt
+
+```c
+// Check if a connection has been interrupted (called by execution engine)
+#[no_mangle] pub extern "C" fn bolt_connection_is_interrupted(client: BoltClient) -> bool;
+```
+
+#### What happens to the QueryBuffer on RESET
+
+When RESET triggers INTERRUPTED:
+1. If a QueryBuffer is actively being written to (execution in progress):
+   - The interrupt flag causes execution to abort
+   - Execution calls `bolt_buffer_error()` which marks the buffer as complete with error
+2. When RESET is processed (state → READY):
+   - If the buffer hasn't been consumed by PULL yet, it is discarded and freed
+   - The 10-second timer (if started) is cancelled
+3. The `client_to_buffer` mapping is cleared for this client
+
+#### Sequence diagram: RESET during query execution
+
+```
+Client                   Event Loop Thread           Execution Thread
+  │                           │                           │
+  │─── RUN {query} ─────────►│                           │
+  │◄── SUCCESS {fields,qid} ─│──── handler.run() ───────►│
+  │                           │                           │── executing...
+  │                           │                           │── EmitRow → buffer
+  │─── RESET ────────────────►│                           │── EmitRow → buffer
+  │                           │── set interrupt_flag ────►│
+  │                           │── state → INTERRUPTED     │── polls flag → abort
+  │                           │                           │── bolt_buffer_error()
+  │                           │                           │── (done)
+  │                           │                           │
+  │                           │── process queued msgs:    │
+  │                           │   (none in this case)     │
+  │                           │                           │
+  │                           │── process RESET:          │
+  │                           │   discard QueryBuffer     │
+  │                           │   clear interrupt_flag    │
+  │◄── SUCCESS {} ───────────│── state → READY           │
+  │                           │                           │
+  │─── RUN {new query} ─────►│  (connection is clean)    │
+```
+
+#### Sequence diagram: RESET with pipelined messages
+
+Drivers often pipeline messages. If a client sends RUN + PULL + RESET, the RUN and PULL arrive before RESET:
+
+```
+Client                   Event Loop Thread
+  │                           │
+  │─── RUN {query} ─────────►│  (queued)
+  │─── PULL {n:-1} ─────────►│  (queued)
+  │─── RESET ────────────────►│
+  │                           │── <INTERRUPT> signal → state: INTERRUPTED
+  │                           │
+  │                           │── process RUN:
+  │◄── IGNORED ──────────────│   (state is INTERRUPTED, ignore)
+  │                           │
+  │                           │── process PULL:
+  │◄── IGNORED ──────────────│   (state is INTERRUPTED, ignore)
+  │                           │
+  │                           │── process RESET:
+  │◄── SUCCESS {} ───────────│   state → READY
+```
+
+#### Multiple RESETs
+
+If multiple RESETs are pipelined, each additional RESET while in INTERRUPTED state generates another `<INTERRUPT>` (no-op since already interrupted). The first RESET transitions to READY; subsequent RESETs in READY state also succeed (READY → INTERRUPTED → READY):
+
+```
+Client                   Event Loop Thread
+  │─── RESET ────────────────►│── state → INTERRUPTED
+  │─── RESET ────────────────►│── (already INTERRUPTED, no-op)
+  │                           │── process first RESET:
+  │◄── SUCCESS {} ───────────│── state → READY
+  │                           │── process second RESET:
+  │                           │── <INTERRUPT> → INTERRUPTED → process → READY
+  │◄── SUCCESS {} ───────────│── state → READY
+```
 
 ---
 
