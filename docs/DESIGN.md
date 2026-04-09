@@ -39,8 +39,15 @@ falkordb-bolt-rs/
 │   │   └── chunking.rs           # Chunked transfer encoding (16-bit size headers)
 │   ├── transport/
 │   │   ├── mod.rs
-│   │   ├── tcp.rs                # TCP listener + accept
-│   │   ├── websocket.rs          # WS handshake (HTTP upgrade) + frame wrapping
+│   │   ├── tcp.rs                # TCP listener + accept + non-blocking I/O
+│   │   │                         #   Handle EAGAIN/WouldBlock consistently on
+│   │   │                         #   both initial and continuation reads
+│   │   ├── websocket.rs          # WS handshake (HTTP upgrade) + frame encode/decode
+│   │   │                         #   - HTTP upgrade: parse Connection header per RFC 7230
+│   │   │                         #     (comma-separated tokens, case-insensitive, skip OWS)
+│   │   │                         #   - Frame write: all 3 payload length formats
+│   │   │                         #     (≤125: 7-bit, ≤65535: 16-bit, >65535: 64-bit extended)
+│   │   │                         #   - Reject non-WS, non-Bolt connections gracefully
 │   │   └── tls.rs                # Optional TLS wrapper (feature-gated)
 │   ├── server/
 │   │   ├── mod.rs
@@ -218,7 +225,12 @@ impl PackStreamWriter {
     pub fn new() -> Self;
     pub fn write_null(&mut self);
     pub fn write_bool(&mut self, value: bool);
-    pub fn write_int(&mut self, value: i64);      // Auto-selects TINY/8/16/32/64
+    /// Auto-selects minimal encoding: TINY_INT (-16..127, 1 byte),
+    /// INT8 (-128..-17), INT16 (-32768..-129 and 128..32767),
+    /// INT32, INT64. The signed range check for TINY_INT must use
+    /// i8 comparison, not unsigned — comparing against unsigned 0xF0
+    /// silently disables the tiny int path for negative values.
+    pub fn write_int(&mut self, value: i64);
     pub fn write_float(&mut self, value: f64);
     pub fn write_string(&mut self, value: &str);   // Borrows, no copy of input
     pub fn write_bytes(&mut self, value: &[u8]);   // Borrows, no copy of input
@@ -239,6 +251,11 @@ impl PackStreamWriter {
 /// Returns borrowed references where possible (zero-copy for strings/bytes).
 /// The lifetime 'a ties returned references to the buffer — they are valid
 /// as long as the underlying message buffer is alive.
+///
+/// All multi-byte integer reads use from_be_bytes() on byte slices — never
+/// raw pointer casts (which cause UB on strict-alignment architectures).
+/// Size-reading methods (map/list/string headers) use the correctly-sized
+/// conversion for each marker variant (8/16/32-bit).
 pub struct PackStreamReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -424,6 +441,11 @@ pub enum ResponseType { Success, Failure }
 impl BoltState {
     /// Given current state + request type + response type, return next state.
     /// Returns Err if the transition is invalid (protocol violation).
+    ///
+    /// Key transitions that must not be missed:
+    /// - ROLLBACK in TX_STREAMING → READY (success) or FAILED (failure)
+    /// - ROLLBACK in TX_READY → READY (success) or FAILED (failure)
+    /// - RESET from any active state → INTERRUPTED (via interrupt signal)
     pub fn transition(
         &self,
         request: &BoltRequest,
@@ -616,12 +638,15 @@ impl BoltConnection {
 
     // --- High-level entity writers (zero-copy) ---
     // Write struct header + fixed fields. Caller then writes labels/properties.
-    pub fn write_node_header(&mut self, id: i64, label_count: u32, prop_count: u32);
+    // Each method hardcodes the correct struct tag and field count internally.
+    // This prevents field count mismatches (e.g., declaring 3 fields but writing 4)
+    // which corrupt all subsequent data in the message.
+    pub fn write_node_header(&mut self, id: i64, label_count: u32, prop_count: u32);  // 0x4E, 4 fields
     pub fn write_relationship_header(&mut self, id: i64, start_id: i64, end_id: i64,
-        rel_type: &str, prop_count: u32);
-    pub fn write_unbound_relationship_header(&mut self, id: i64, rel_type: &str, prop_count: u32);
-    pub fn write_path_header(&mut self, node_count: u32, rel_count: u32, index_count: u32);
-    pub fn write_point2d(&mut self, srid: i64, x: f64, y: f64);
+        rel_type: &str, prop_count: u32);  // 0x52, 8 fields
+    pub fn write_unbound_relationship_header(&mut self, id: i64, rel_type: &str, prop_count: u32);  // 0x72, 4 fields
+    pub fn write_path_header(&mut self, node_count: u32, rel_count: u32, index_count: u32);  // 0x50, 3 fields
+    pub fn write_point2d(&mut self, srid: i64, x: f64, y: f64);  // 0x58, 3 fields
 
 
     /// End current message (write zero-chunk terminator).
@@ -862,6 +887,9 @@ fn write_runtime_value(conn: &mut BoltConnection, runtime: &Runtime, value: Valu
 pub type BoltClient = *mut BoltConnection;
 
 // --- Callback function pointer types for C ---
+// Note: empty credentials (len=0) is valid and distinct from "no auth".
+// The crate always passes the exact string from the LOGON message — never null.
+// The host is responsible for deciding whether empty credentials are acceptable.
 pub type BoltAuthCallback = extern "C" fn(
     conn: BoltClient,
     scheme: *const c_char, scheme_len: u32,
@@ -2523,57 +2551,13 @@ Version negotiation: Accept client proposals for 5.1-5.8 range. Respond with 5.8
 
 ## Part 6: Verification & Testing
 
-### Lessons from the existing C implementation bugs
-
-[FalkorDB/FalkorDB#1703](https://github.com/FalkorDB/FalkorDB/pull/1703) fixes 18 bugs in the current C Bolt implementation. These bugs directly inform what our Rust crate must get right and what our test suite must cover.
-
-**Bugs our Rust design avoids structurally:**
-
-| C Bug | Rust mitigation |
-|-------|-----------------|
-| `ntohs` instead of `ntohl` for MAP32 size — silently truncates maps | `u32::from_be_bytes()` — type system prevents size confusion |
-| `bolt_reply_int` never emits tiny ints (unsigned `0xF0` = 240 comparison) | Rust's signed `i8` range check. No unsigned/signed confusion |
-| Stack buffer overflow in `is_authenticated` (64-byte fixed buffer) | `read_string()` returns `&str` slice — no buffer to overflow |
-| `write_value` into fixed 4096-byte stack buffer (overflow on large params) | `PackStreamWriter` uses growable `BytesMut` |
-| VLA with attacker-controlled `len` for credentials | No VLAs in Rust. All buffers are heap-allocated and bounds-checked |
-| Unaligned pointer casts `*(int16_t*)(ptr+1)` — UB on strict-alignment | `from_be_bytes()` with safe byte slicing |
-| Point2D writes 4 fields but declares 3 — corrupts framing | `write_point2d()` has hardcoded correct count in one place |
-| Unlimited recursion depth in `write_value` | Streaming writer has no recursion — host writes sequentially |
-
-**Bugs that inform our test suite (must reproduce and verify as regression tests):**
-
-| PR Test | What it catches | Our coverage |
-|---------|----------------|-------------|
-| `test10` tiny int -16..127 | TINY_INT encoding for negative values | Unit: PackStream int encoding range |
-| `test11` negative int boundaries | int8/16/32/64 min values | Unit: all integer width boundaries |
-| `test12-13` Point2D + subsequent values | Struct field count corruption | Unit + Integration: write_point2d framing |
-| `test14,21` large string params (8KB) | Fixed buffer overflow | Integration: large value round-trip |
-| `test15` 100 parameters | Buffer growth under many params | Integration: many-parameter stress |
-| `test16` int16/string16/list16 | 16-bit PackStream markers | Unit: all size header variants |
-| `test17` int32/int64 boundaries | Full integer encoding range | Unit: boundary values |
-| `test18-20` RESET / session cycling | RESET message handling | Integration: connection recovery |
-| `test25-26` consecutive rollbacks | Transaction state machine | Integration: ROLLBACK in TX_STREAMING |
-| `test30` WebSocket handshake | WS transport works | Integration: WebSocket connection |
-| `test31` reject invalid connection | Garbage input handling | Integration: **new — must add** |
-| `test32` Connection header variants | WS header parsing (RFC 7230 OWS) | Integration: **new — must add** |
-
-**Additional design insights from the PR:**
-
-1. **Auth edge case**: Empty credentials ≠ no password. The PR fixes auth to distinguish these cases. Our `BoltAuthCallback` passes credentials to the host (host decides), but we should ensure the crate passes empty strings correctly, not `null`.
-
-2. **WebSocket 64-bit payload length**: The PR adds support for WS payloads >65535. Our `transport/websocket.rs` must handle all three WS length formats (7-bit ≤125, 16-bit ≤65535, 64-bit >65535).
-
-3. **ROLLBACK state transition**: The PR adds missing ROLLBACK handling in TX_STREAMING state (→ READY on success, → FAILED on failure). Our state machine must include this.
-
-4. **Non-blocking socket EAGAIN**: `recv()` returning -1 with `EAGAIN` is not a disconnect — it's "try again later". Our Rust transport handles this via `ErrorKind::WouldBlock`, but we should test it.
-
 ### Level 1: Unit Tests (no network, no external dependencies)
 
 Run as `cargo test` in the crate. Test the building blocks in isolation.
 
 - **PackStream integer encoding**: Verify minimal encoding for the full range:
-  - TINY_INT: -16 to 127 (single byte, **must** include negative range — the C bug was here)
-  - INT8: -128 to -17, 128 to 127 (but 128 doesn't fit in i8, so actually only negative range)
+  - TINY_INT: -16 to 127 (single byte — must include the negative range)
+  - INT8: -128 to -17
   - INT16: -32768 to -129 and 128 to 32767
   - INT32: ±2147483647 boundaries
   - INT64: ±9223372036854775807 boundaries
@@ -2582,11 +2566,11 @@ Run as `cargo test` in the crate. Test the building blocks in isolation.
 - **PackStream size headers**: Verify correct marker selection for 8-bit vs 16-bit vs 32-bit size headers (string8/16/32, list8/16/32, map8/16/32)
 - **Message parsing**: For all 13 request types, construct raw PackStream bytes and parse into the corresponding message struct. Verify borrowed `&str` fields point to the correct buffer range.
 - **Message serialization**: For SUCCESS/FAILURE/IGNORED/RECORD, write to a buffer and verify the bytes match the spec.
-- **State machine transitions**: Test all valid transitions (READY + RUN → STREAMING, etc.) and verify invalid ones return errors. Test `should_ignore()` in FAILED and INTERRUPTED states. **Include ROLLBACK in TX_STREAMING** (found missing in C code).
+- **State machine transitions**: Test all valid transitions (READY + RUN → STREAMING, ROLLBACK in TX_STREAMING → READY, etc.) and verify invalid ones return errors. Test `should_ignore()` in FAILED and INTERRUPTED states.
 - **Chunking**: Encode/decode with small messages (single chunk), large messages (multi-chunk), and edge cases (exactly chunk-sized, empty message, max chunk size 65535).
-- **WebSocket frame**: Encode/decode with and without masking. Test all three payload length formats: ≤125 (7-bit), 126-65535 (16-bit), >65535 (64-bit extended). Test fragmented frames.
+- **WebSocket frame**: Encode/decode with and without masking. Test all three payload length formats (≤125 7-bit, ≤65535 16-bit, >65535 64-bit extended). Test fragmented frames.
 - **Version negotiation**: Test handshake parsing with various client version proposals, verify correct version selection.
-- **Struct field counts**: Verify that `write_node_header`, `write_relationship_header`, `write_point2d`, etc. produce the correct struct tag + field count. A wrong count corrupts all subsequent data in the message (as the Point2D bug showed).
+- **Struct field counts**: Verify that `write_node_header`, `write_relationship_header`, `write_point2d`, etc. produce the correct struct tag + field count. A wrong count silently corrupts all subsequent data in the message.
 
 ### Level 2: Standalone Crate Integration Tests (real drivers, mock handler)
 
@@ -2682,7 +2666,7 @@ fn start_mock_server(handler: MockBoltHandler) -> (u16, JoinHandle<()>) {
 | `test_hello_success` | HELLO succeeds, driver receives server metadata. |
 | `test_auth_basic` | LOGON with basic auth succeeds. |
 | `test_auth_failure` | LOGON with bad credentials → FAILURE, connection still usable after RESET. |
-| `test_auth_empty_credentials` | LOGON with empty credentials string (not null). Verify crate passes empty string to handler, not null. (PR#1703 auth fix) |
+| `test_auth_empty_credentials` | LOGON with empty credentials string (not null). Verify crate passes empty string to handler, not null. |
 | `test_goodbye_clean_disconnect` | GOODBYE closes connection cleanly. |
 
 **B. Query execution (RUN, PULL, DISCARD)**
@@ -2738,28 +2722,28 @@ Each test uses a canned query that returns a specific value type, then verifies 
 | `test_transaction_rollback` | BEGIN → RUN → ROLLBACK. No side effects. |
 | `test_transaction_error` | BEGIN → RUN (error) → FAILURE → RESET → recovered. |
 
-**F. Stress and boundary tests** (informed by PR#1703 bugs)
+**F. Stress and boundary tests**
 
-| Test | What it verifies | PR#1703 reference |
-|------|-----------------|-------------------|
-| `test_large_string_parameter` | 8KB string parameter round-trip | test14, test21 — fixed stack buffer overflow |
-| `test_many_parameters` | 100 parameters in a single query | test15 — stress buffer growth |
-| `test_large_list_parameter` | 200-element list round-trip | test22 — recursive serialization |
-| `test_nested_map_parameter` | Nested map `{a: {b: {c: 1}}}` round-trip | test23 — recursive map handling |
-| `test_many_large_parameters` | 15 params × 500 bytes each | test24 — combined stress |
-| `test_rapid_session_cycling` | 20 iterations: open session → query → close | test20 — RESET under connection pooling |
-| `test_consecutive_rollbacks` | 5 consecutive BEGIN/ROLLBACK in same session | test25 — ROLLBACK state transitions |
+| Test | What it verifies |
+|------|-----------------|
+| `test_large_string_parameter` | 8KB string parameter round-trip. |
+| `test_many_parameters` | 100 parameters in a single query. |
+| `test_large_list_parameter` | 200-element list round-trip. |
+| `test_nested_map_parameter` | Nested map `{a: {b: {c: 1}}}` round-trip. |
+| `test_many_large_parameters` | 15 params × 500 bytes each. |
+| `test_rapid_session_cycling` | 20 iterations: open session → query → close. Stresses RESET under connection pooling. |
+| `test_consecutive_rollbacks` | 5 consecutive BEGIN/ROLLBACK in same session. Verifies TX_STREAMING → READY transitions. |
 
 **G. Transport variants**
 
-| Test | What it verifies | PR#1703 reference |
-|------|-----------------|-------------------|
-| `test_tcp_connection` | Standard TCP bolt:// connection works. | |
-| `test_websocket_connection` | WebSocket bolt+s:// / ws connection works (HTTP upgrade, framing). | test30 |
-| `test_websocket_large_payload` | WS frame with >65535 byte payload (64-bit extended length). | PR fixed missing 64-bit WS length support |
-| `test_websocket_header_variants` | WS upgrade with `Connection: keep-alive, Upgrade` (comma-separated, mixed case, OWS). | test32 — RFC 7230 compliance |
-| `test_invalid_connection_rejected` | Garbage bytes on the TCP port → server closes connection, doesn't crash. | test31 |
-| `test_large_message` | Query with >64KB parameter string. Verifies multi-chunk handling. | |
+| Test | What it verifies |
+|------|-----------------|
+| `test_tcp_connection` | Standard TCP bolt:// connection works. |
+| `test_websocket_connection` | WebSocket connection works (HTTP upgrade, framing). |
+| `test_websocket_large_payload` | WS frame with >65535 byte payload (64-bit extended length). |
+| `test_websocket_header_variants` | WS upgrade with `Connection: keep-alive, Upgrade` (comma-separated, mixed case, OWS per RFC 7230). |
+| `test_invalid_connection_rejected` | Garbage bytes on the TCP port → server closes connection, doesn't crash. |
+| `test_large_message` | Query with >64KB parameter string. Verifies multi-chunk handling. |
 
 **H. Driver compatibility matrix**
 
