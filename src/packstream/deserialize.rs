@@ -1,6 +1,6 @@
 // PackStream read (deserialization) — zero-copy reader.
 
-use crate::packstream::marker;
+use crate::packstream::marker::Marker;
 
 /// Errors that can occur during PackStream deserialization.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,54 +105,60 @@ impl<'a> PackStreamReader<'a> {
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    // ---- marker parsing ----
+
+    fn read_marker(&mut self) -> Result<Marker, PackStreamError> {
+        let b = self.read_u8()?;
+        Marker::from_byte(b).map_err(|e| PackStreamError::InvalidMarker(e.0))
+    }
+
     // ---- size helpers for containers/strings/bytes ----
 
-    /// Read a string length from a marker byte (already consumed).
-    fn string_len(&mut self, m: u8) -> Result<usize, PackStreamError> {
-        match m {
-            0x80..=0x8F => Ok((m & 0x0F) as usize),
-            marker::STRING8 => Ok(self.read_u8()? as usize),
-            marker::STRING16 => Ok(self.read_u16()? as usize),
-            marker::STRING32 => Ok(self.read_u32()? as usize),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+    fn string_len(&mut self, marker: Marker) -> Result<usize, PackStreamError> {
+        match marker {
+            Marker::TinyString(size) => Ok(size as usize),
+            Marker::String8 => Ok(self.read_u8()? as usize),
+            Marker::String16 => Ok(self.read_u16()? as usize),
+            Marker::String32 => Ok(self.read_u32()? as usize),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
-    fn bytes_len(&mut self, m: u8) -> Result<usize, PackStreamError> {
-        match m {
-            marker::BYTES8 => Ok(self.read_u8()? as usize),
-            marker::BYTES16 => Ok(self.read_u16()? as usize),
-            marker::BYTES32 => Ok(self.read_u32()? as usize),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+    fn bytes_len(&mut self, marker: Marker) -> Result<usize, PackStreamError> {
+        match marker {
+            Marker::Bytes8 => Ok(self.read_u8()? as usize),
+            Marker::Bytes16 => Ok(self.read_u16()? as usize),
+            Marker::Bytes32 => Ok(self.read_u32()? as usize),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
-    fn list_len(&mut self, m: u8) -> Result<usize, PackStreamError> {
-        match m {
-            0x90..=0x9F => Ok((m & 0x0F) as usize),
-            marker::LIST8 => Ok(self.read_u8()? as usize),
-            marker::LIST16 => Ok(self.read_u16()? as usize),
-            marker::LIST32 => Ok(self.read_u32()? as usize),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+    fn list_len(&mut self, marker: Marker) -> Result<usize, PackStreamError> {
+        match marker {
+            Marker::TinyList(size) => Ok(size as usize),
+            Marker::List8 => Ok(self.read_u8()? as usize),
+            Marker::List16 => Ok(self.read_u16()? as usize),
+            Marker::List32 => Ok(self.read_u32()? as usize),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
-    fn map_len(&mut self, m: u8) -> Result<usize, PackStreamError> {
-        match m {
-            0xA0..=0xAF => Ok((m & 0x0F) as usize),
-            marker::MAP8 => Ok(self.read_u8()? as usize),
-            marker::MAP16 => Ok(self.read_u16()? as usize),
-            marker::MAP32 => Ok(self.read_u32()? as usize),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+    fn map_len(&mut self, marker: Marker) -> Result<usize, PackStreamError> {
+        match marker {
+            Marker::TinyMap(size) => Ok(size as usize),
+            Marker::Map8 => Ok(self.read_u8()? as usize),
+            Marker::Map16 => Ok(self.read_u16()? as usize),
+            Marker::Map32 => Ok(self.read_u32()? as usize),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
-    fn struct_len(&mut self, m: u8) -> Result<usize, PackStreamError> {
-        match m {
-            0xB0..=0xBF => Ok((m & 0x0F) as usize),
-            marker::STRUCT8 => Ok(self.read_u8()? as usize),
-            marker::STRUCT16 => Ok(self.read_u16()? as usize),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+    fn struct_len(&mut self, marker: Marker) -> Result<usize, PackStreamError> {
+        match marker {
+            Marker::TinyStruct(size) => Ok(size as usize),
+            Marker::Struct8 => Ok(self.read_u8()? as usize),
+            Marker::Struct16 => Ok(self.read_u16()? as usize),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
@@ -160,43 +166,42 @@ impl<'a> PackStreamReader<'a> {
 
     /// Consume a NULL marker.
     pub fn read_null(&mut self) -> Result<(), PackStreamError> {
-        let m = self.read_u8()?;
-        if m == marker::NULL {
+        let marker = self.read_marker()?;
+        if marker == Marker::Null {
             Ok(())
         } else {
-            Err(PackStreamError::InvalidMarker(m))
+            Err(PackStreamError::InvalidMarker(marker.to_byte()))
         }
     }
 
     /// Read a boolean value.
     pub fn read_bool(&mut self) -> Result<bool, PackStreamError> {
-        let m = self.read_u8()?;
-        match m {
-            marker::TRUE => Ok(true),
-            marker::FALSE => Ok(false),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+        let marker = self.read_marker()?;
+        match marker {
+            Marker::True => Ok(true),
+            Marker::False => Ok(false),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
     /// Read an integer value from any int marker (TINY_INT, INT8, INT16, INT32, INT64).
     pub fn read_int(&mut self) -> Result<i64, PackStreamError> {
-        let m = self.read_u8()?;
-        match m {
-            // TINY_INT: the marker byte IS the value (interpreted as signed)
-            _ if (m as i8) >= marker::TINY_INT_MIN => Ok((m as i8) as i64),
-            marker::INT8 => Ok(self.read_i8()? as i64),
-            marker::INT16 => Ok(self.read_i16()? as i64),
-            marker::INT32 => Ok(self.read_i32()? as i64),
-            marker::INT64 => self.read_i64(),
-            _ => Err(PackStreamError::InvalidMarker(m)),
+        let marker = self.read_marker()?;
+        match marker {
+            Marker::TinyInt(v) => Ok(v as i64),
+            Marker::Int8 => Ok(self.read_i8()? as i64),
+            Marker::Int16 => Ok(self.read_i16()? as i64),
+            Marker::Int32 => Ok(self.read_i32()? as i64),
+            Marker::Int64 => self.read_i64(),
+            _ => Err(PackStreamError::InvalidMarker(marker.to_byte())),
         }
     }
 
     /// Read a 64-bit float value.
     pub fn read_float(&mut self) -> Result<f64, PackStreamError> {
-        let m = self.read_u8()?;
-        if m != marker::FLOAT64 {
-            return Err(PackStreamError::InvalidMarker(m));
+        let marker = self.read_marker()?;
+        if marker != Marker::Float64 {
+            return Err(PackStreamError::InvalidMarker(marker.to_byte()));
         }
         let bytes = self.read_exact(8)?;
         Ok(f64::from_be_bytes([
@@ -206,105 +211,84 @@ impl<'a> PackStreamReader<'a> {
 
     /// Read a string value — **zero-copy**: returns a slice into the original buffer.
     pub fn read_string(&mut self) -> Result<&'a str, PackStreamError> {
-        let m = self.read_u8()?;
-        let len = self.string_len(m)?;
+        let marker = self.read_marker()?;
+        let len = self.string_len(marker)?;
         let bytes = self.read_exact(len)?;
         std::str::from_utf8(bytes).map_err(|_| PackStreamError::InvalidUtf8)
     }
 
     /// Read a byte array — **zero-copy**: returns a slice into the original buffer.
     pub fn read_bytes(&mut self) -> Result<&'a [u8], PackStreamError> {
-        let m = self.read_u8()?;
-        let len = self.bytes_len(m)?;
+        let marker = self.read_marker()?;
+        let len = self.bytes_len(marker)?;
         self.read_exact(len)
     }
 
     /// Read a list header and return the number of elements.
     pub fn read_list_header(&mut self) -> Result<usize, PackStreamError> {
-        let m = self.read_u8()?;
-        self.list_len(m)
+        let marker = self.read_marker()?;
+        self.list_len(marker)
     }
 
     /// Read a map header and return the number of entries.
     pub fn read_map_header(&mut self) -> Result<usize, PackStreamError> {
-        let m = self.read_u8()?;
-        self.map_len(m)
+        let marker = self.read_marker()?;
+        self.map_len(marker)
     }
 
     /// Read a struct header and return `(tag_byte, num_fields)`.
     pub fn read_struct_header(&mut self) -> Result<(u8, usize), PackStreamError> {
-        let m = self.read_u8()?;
-        let num_fields = self.struct_len(m)?;
+        let marker = self.read_marker()?;
+        let num_fields = self.struct_len(marker)?;
         let tag = self.read_u8()?;
         Ok((tag, num_fields))
     }
 
     /// Skip any value without deserializing it. Handles nested structures recursively.
     pub fn skip_value(&mut self) -> Result<(), PackStreamError> {
-        let m = self.read_u8()?;
-        match m {
-            // Null
-            marker::NULL => Ok(()),
+        let marker = self.read_marker()?;
+        match marker {
+            Marker::Null | Marker::True | Marker::False | Marker::TinyInt(_) => Ok(()),
 
-            // Boolean
-            marker::TRUE | marker::FALSE => Ok(()),
-
-            // Tiny int (positive 0x00..=0x7F or negative 0xF0..=0xFF)
-            _ if (m as i8) >= marker::TINY_INT_MIN => Ok(()),
-
-            // INT8
-            marker::INT8 => {
+            Marker::Int8 => {
                 self.read_exact(1)?;
                 Ok(())
             }
-            // INT16
-            marker::INT16 => {
+            Marker::Int16 => {
                 self.read_exact(2)?;
                 Ok(())
             }
-            // INT32
-            marker::INT32 => {
+            Marker::Int32 => {
                 self.read_exact(4)?;
                 Ok(())
             }
-            // INT64
-            marker::INT64 => {
+            Marker::Int64 | Marker::Float64 => {
                 self.read_exact(8)?;
                 Ok(())
             }
 
-            // FLOAT64
-            marker::FLOAT64 => {
-                self.read_exact(8)?;
-                Ok(())
-            }
-
-            // String
-            0x80..=0x8F | marker::STRING8 | marker::STRING16 | marker::STRING32 => {
-                let len = self.string_len(m)?;
+            Marker::TinyString(_) | Marker::String8 | Marker::String16 | Marker::String32 => {
+                let len = self.string_len(marker)?;
                 self.read_exact(len)?;
                 Ok(())
             }
 
-            // Bytes
-            marker::BYTES8 | marker::BYTES16 | marker::BYTES32 => {
-                let len = self.bytes_len(m)?;
+            Marker::Bytes8 | Marker::Bytes16 | Marker::Bytes32 => {
+                let len = self.bytes_len(marker)?;
                 self.read_exact(len)?;
                 Ok(())
             }
 
-            // List
-            0x90..=0x9F | marker::LIST8 | marker::LIST16 | marker::LIST32 => {
-                let len = self.list_len(m)?;
+            Marker::TinyList(_) | Marker::List8 | Marker::List16 | Marker::List32 => {
+                let len = self.list_len(marker)?;
                 for _ in 0..len {
                     self.skip_value()?;
                 }
                 Ok(())
             }
 
-            // Map
-            0xA0..=0xAF | marker::MAP8 | marker::MAP16 | marker::MAP32 => {
-                let len = self.map_len(m)?;
+            Marker::TinyMap(_) | Marker::Map8 | Marker::Map16 | Marker::Map32 => {
+                let len = self.map_len(marker)?;
                 for _ in 0..len {
                     self.skip_value()?; // key
                     self.skip_value()?; // value
@@ -312,17 +296,14 @@ impl<'a> PackStreamReader<'a> {
                 Ok(())
             }
 
-            // Struct
-            0xB0..=0xBF | marker::STRUCT8 | marker::STRUCT16 => {
-                let num_fields = self.struct_len(m)?;
+            Marker::TinyStruct(_) | Marker::Struct8 | Marker::Struct16 => {
+                let num_fields = self.struct_len(marker)?;
                 self.read_exact(1)?; // tag byte
                 for _ in 0..num_fields {
                     self.skip_value()?;
                 }
                 Ok(())
             }
-
-            _ => Err(PackStreamError::InvalidMarker(m)),
         }
     }
 }
@@ -330,13 +311,13 @@ impl<'a> PackStreamReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packstream::marker;
+    use crate::packstream::marker::Marker;
 
     // ---- Null ----
 
     #[test]
     fn read_null() {
-        let data = [marker::NULL];
+        let data = [Marker::Null.to_byte()];
         let mut r = PackStreamReader::new(&data);
         assert!(r.read_null().is_ok());
         assert_eq!(r.remaining(), 0);
@@ -344,11 +325,11 @@ mod tests {
 
     #[test]
     fn read_null_wrong_marker() {
-        let data = [marker::TRUE];
+        let data = [Marker::True.to_byte()];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(
             r.read_null(),
-            Err(PackStreamError::InvalidMarker(marker::TRUE))
+            Err(PackStreamError::InvalidMarker(Marker::True.to_byte()))
         );
     }
 
@@ -356,14 +337,14 @@ mod tests {
 
     #[test]
     fn read_bool_true() {
-        let data = [marker::TRUE];
+        let data = [Marker::True.to_byte()];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_bool().unwrap(), true);
     }
 
     #[test]
     fn read_bool_false() {
-        let data = [marker::FALSE];
+        let data = [Marker::False.to_byte()];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_bool().unwrap(), false);
     }
@@ -409,7 +390,7 @@ mod tests {
     #[test]
     fn read_int8() {
         // INT8 marker + value -100 (0x9C)
-        let data = [marker::INT8, 0x9C];
+        let data = [Marker::Int8.to_byte(), 0x9C];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), -100);
     }
@@ -417,14 +398,14 @@ mod tests {
     #[test]
     fn read_int8_minus_17() {
         // -17 is the first value below TINY_INT range
-        let data = [marker::INT8, (-17i8 as u8)];
+        let data = [Marker::Int8.to_byte(), (-17i8 as u8)];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), -17);
     }
 
     #[test]
     fn read_int8_minus_128() {
-        let data = [marker::INT8, 0x80]; // -128 as i8
+        let data = [Marker::Int8.to_byte(), 0x80]; // -128 as i8
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), -128);
     }
@@ -432,7 +413,7 @@ mod tests {
     #[test]
     fn read_int16() {
         // 1000 = 0x03E8
-        let data = [marker::INT16, 0x03, 0xE8];
+        let data = [Marker::Int16.to_byte(), 0x03, 0xE8];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), 1000);
     }
@@ -440,7 +421,7 @@ mod tests {
     #[test]
     fn read_int16_negative() {
         // -1000 as i16 = 0xFC18
-        let data = [marker::INT16, 0xFC, 0x18];
+        let data = [Marker::Int16.to_byte(), 0xFC, 0x18];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), -1000);
     }
@@ -448,7 +429,7 @@ mod tests {
     #[test]
     fn read_int32() {
         // 100_000 = 0x000186A0
-        let data = [marker::INT32, 0x00, 0x01, 0x86, 0xA0];
+        let data = [Marker::Int32.to_byte(), 0x00, 0x01, 0x86, 0xA0];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), 100_000);
     }
@@ -457,7 +438,13 @@ mod tests {
     fn read_int32_negative() {
         let val: i32 = -100_000;
         let bytes = val.to_be_bytes();
-        let data = [marker::INT32, bytes[0], bytes[1], bytes[2], bytes[3]];
+        let data = [
+            Marker::Int32.to_byte(),
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+        ];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), -100_000);
     }
@@ -466,7 +453,7 @@ mod tests {
     fn read_int64() {
         let val: i64 = 1_000_000_000_000;
         let bytes = val.to_be_bytes();
-        let mut data = vec![marker::INT64];
+        let mut data = vec![Marker::Int64.to_byte()];
         data.extend_from_slice(&bytes);
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), 1_000_000_000_000);
@@ -476,7 +463,7 @@ mod tests {
     fn read_int64_min() {
         let val: i64 = i64::MIN;
         let bytes = val.to_be_bytes();
-        let mut data = vec![marker::INT64];
+        let mut data = vec![Marker::Int64.to_byte()];
         data.extend_from_slice(&bytes);
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int().unwrap(), i64::MIN);
@@ -488,7 +475,7 @@ mod tests {
     fn read_float() {
         let val: f64 = 3.14;
         let bytes = val.to_be_bytes();
-        let mut data = vec![marker::FLOAT64];
+        let mut data = vec![Marker::Float64.to_byte()];
         data.extend_from_slice(&bytes);
         let mut r = PackStreamReader::new(&data);
         assert!((r.read_float().unwrap() - 3.14).abs() < f64::EPSILON);
@@ -497,7 +484,7 @@ mod tests {
     #[test]
     fn read_float_zero() {
         let bytes = 0.0f64.to_be_bytes();
-        let mut data = vec![marker::FLOAT64];
+        let mut data = vec![Marker::Float64.to_byte()];
         data.extend_from_slice(&bytes);
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_float().unwrap(), 0.0);
@@ -507,7 +494,7 @@ mod tests {
     fn read_float_negative() {
         let val: f64 = -1.5;
         let bytes = val.to_be_bytes();
-        let mut data = vec![marker::FLOAT64];
+        let mut data = vec![Marker::Float64.to_byte()];
         data.extend_from_slice(&bytes);
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_float().unwrap(), -1.5);
@@ -534,7 +521,7 @@ mod tests {
     #[test]
     fn read_string8() {
         let s = "a]".repeat(20); // 40 bytes > 15
-        let mut data = vec![marker::STRING8, 40];
+        let mut data = vec![Marker::String8.to_byte(), 40];
         data.extend_from_slice(s.as_bytes());
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_string().unwrap(), s);
@@ -544,7 +531,7 @@ mod tests {
     fn read_string16() {
         let s = "x".repeat(300);
         let len = 300u16;
-        let mut data = vec![marker::STRING16];
+        let mut data = vec![Marker::String16.to_byte()];
         data.extend_from_slice(&len.to_be_bytes());
         data.extend_from_slice(s.as_bytes());
         let mut r = PackStreamReader::new(&data);
@@ -580,7 +567,7 @@ mod tests {
     #[test]
     fn read_bytes8() {
         let payload = [0x01, 0x02, 0x03, 0x04];
-        let mut data = vec![marker::BYTES8, 4];
+        let mut data = vec![Marker::Bytes8.to_byte(), 4];
         data.extend_from_slice(&payload);
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_bytes().unwrap(), &payload);
@@ -589,7 +576,7 @@ mod tests {
     #[test]
     fn read_bytes_zero_copy() {
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
-        let mut data = vec![marker::BYTES8, 4];
+        let mut data = vec![Marker::Bytes8.to_byte(), 4];
         data.extend_from_slice(&payload);
         let r_data = &data[..];
         let mut reader = PackStreamReader::new(r_data);
@@ -606,7 +593,7 @@ mod tests {
     fn read_bytes16() {
         let payload = vec![0xAB; 300];
         let len = 300u16;
-        let mut data = vec![marker::BYTES16];
+        let mut data = vec![Marker::Bytes16.to_byte()];
         data.extend_from_slice(&len.to_be_bytes());
         data.extend_from_slice(&payload);
         let mut r = PackStreamReader::new(&data);
@@ -624,21 +611,21 @@ mod tests {
 
     #[test]
     fn read_list8_header() {
-        let data = [marker::LIST8, 20];
+        let data = [Marker::List8.to_byte(), 20];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_list_header().unwrap(), 20);
     }
 
     #[test]
     fn read_list16_header() {
-        let data = [marker::LIST16, 0x01, 0x00]; // 256
+        let data = [Marker::List16.to_byte(), 0x01, 0x00]; // 256
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_list_header().unwrap(), 256);
     }
 
     #[test]
     fn read_list32_header() {
-        let data = [marker::LIST32, 0x00, 0x01, 0x00, 0x00]; // 65536
+        let data = [Marker::List32.to_byte(), 0x00, 0x01, 0x00, 0x00]; // 65536
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_list_header().unwrap(), 65536);
     }
@@ -654,7 +641,7 @@ mod tests {
 
     #[test]
     fn read_map8_header() {
-        let data = [marker::MAP8, 20];
+        let data = [Marker::Map8.to_byte(), 20];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_map_header().unwrap(), 20);
     }
@@ -673,7 +660,7 @@ mod tests {
 
     #[test]
     fn read_struct8_header() {
-        let data = [marker::STRUCT8, 5, 0x52]; // 5 fields, tag = RELATIONSHIP
+        let data = [Marker::Struct8.to_byte(), 5, 0x52]; // 5 fields, tag = RELATIONSHIP
         let mut r = PackStreamReader::new(&data);
         let (tag, fields) = r.read_struct_header().unwrap();
         assert_eq!(tag, 0x52);
@@ -684,7 +671,7 @@ mod tests {
 
     #[test]
     fn skip_null() {
-        let data = [marker::NULL];
+        let data = [Marker::Null.to_byte()];
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -692,7 +679,7 @@ mod tests {
 
     #[test]
     fn skip_bool() {
-        let data = [marker::TRUE];
+        let data = [Marker::True.to_byte()];
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -708,7 +695,7 @@ mod tests {
 
     #[test]
     fn skip_int8() {
-        let data = [marker::INT8, 0x9C];
+        let data = [Marker::Int8.to_byte(), 0x9C];
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -716,7 +703,7 @@ mod tests {
 
     #[test]
     fn skip_int16() {
-        let data = [marker::INT16, 0x03, 0xE8];
+        let data = [Marker::Int16.to_byte(), 0x03, 0xE8];
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -724,7 +711,7 @@ mod tests {
 
     #[test]
     fn skip_int32() {
-        let data = [marker::INT32, 0x00, 0x01, 0x86, 0xA0];
+        let data = [Marker::Int32.to_byte(), 0x00, 0x01, 0x86, 0xA0];
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -732,7 +719,7 @@ mod tests {
 
     #[test]
     fn skip_int64() {
-        let mut data = vec![marker::INT64];
+        let mut data = vec![Marker::Int64.to_byte()];
         data.extend_from_slice(&42i64.to_be_bytes());
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
@@ -741,7 +728,7 @@ mod tests {
 
     #[test]
     fn skip_float() {
-        let mut data = vec![marker::FLOAT64];
+        let mut data = vec![Marker::Float64.to_byte()];
         data.extend_from_slice(&3.14f64.to_be_bytes());
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
@@ -759,7 +746,7 @@ mod tests {
 
     #[test]
     fn skip_bytes() {
-        let data = vec![marker::BYTES8, 3, 0x01, 0x02, 0x03];
+        let data = vec![Marker::Bytes8.to_byte(), 3, 0x01, 0x02, 0x03];
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -794,7 +781,7 @@ mod tests {
         // Struct with 2 fields, tag 0x4E
         let mut data = vec![0xB2, 0x4E]; // TINY_STRUCT 2 fields, tag NODE
         data.push(42u8); // field 1: tiny int
-        data.push(marker::NULL); // field 2: null
+        data.push(Marker::Null.to_byte()); // field 2: null
         let mut r = PackStreamReader::new(&data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
@@ -826,7 +813,7 @@ mod tests {
 
     #[test]
     fn unexpected_eof_truncated_int16() {
-        let data = [marker::INT16, 0x03]; // missing second byte
+        let data = [Marker::Int16.to_byte(), 0x03]; // missing second byte
         let mut r = PackStreamReader::new(&data);
         assert_eq!(r.read_int(), Err(PackStreamError::UnexpectedEof));
     }
@@ -840,11 +827,11 @@ mod tests {
 
     #[test]
     fn wrong_marker_for_bool() {
-        let data = [marker::NULL];
+        let data = [Marker::Null.to_byte()];
         let mut r = PackStreamReader::new(&data);
         assert_eq!(
             r.read_bool(),
-            Err(PackStreamError::InvalidMarker(marker::NULL))
+            Err(PackStreamError::InvalidMarker(Marker::Null.to_byte()))
         );
     }
 
@@ -859,9 +846,9 @@ mod tests {
 
     #[test]
     fn peek_returns_next_byte() {
-        let data = [marker::NULL, marker::TRUE];
+        let data = [Marker::Null.to_byte(), Marker::True.to_byte()];
         let r = PackStreamReader::new(&data);
-        assert_eq!(r.peek(), Some(marker::NULL));
+        assert_eq!(r.peek(), Some(Marker::Null.to_byte()));
         assert_eq!(r.remaining(), 2);
     }
 
@@ -878,16 +865,16 @@ mod tests {
     fn read_multiple_values() {
         let mut data = Vec::new();
         // null
-        data.push(marker::NULL);
+        data.push(Marker::Null.to_byte());
         // true
-        data.push(marker::TRUE);
+        data.push(Marker::True.to_byte());
         // int 42
         data.push(42u8);
         // string "hi"
         data.push(0x82);
         data.extend_from_slice(b"hi");
         // float 1.0
-        data.push(marker::FLOAT64);
+        data.push(Marker::Float64.to_byte());
         data.extend_from_slice(&1.0f64.to_be_bytes());
 
         let mut r = PackStreamReader::new(&data);
