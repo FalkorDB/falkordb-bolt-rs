@@ -1,0 +1,1 @@
+// BoltHandler trait

@@ -2,5 +2,21 @@
 name = "falkordb-bolt-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Neo4j Bolt protocol (v5.8) implementation for FalkorDB"
+license = "MIT"
+
+[features]
+default = ["websocket"]
+websocket = ["dep:sha1", "dep:base64"]
+tls = ["dep:rustls"]
+ffi = []
 
 [dependencies]
+bytes = "1"
+sha1 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false }
+log = "0.4"
+
+[build-dependencies]
+cbindgen = "0.28"
