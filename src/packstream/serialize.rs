@@ -1,6 +1,6 @@
 use bytes::{BufMut, BytesMut};
 
-use super::marker;
+use super::marker::Marker;
 
 /// Writes PackStream-encoded data directly to a byte buffer.
 /// Streaming API: call methods sequentially to build messages.
@@ -17,37 +17,40 @@ impl PackStreamWriter {
     }
 
     pub fn write_null(&mut self) {
-        self.buf.put_u8(marker::NULL);
+        self.buf.put_u8(Marker::Null.to_byte());
     }
 
     pub fn write_bool(&mut self, value: bool) {
-        self.buf
-            .put_u8(if value { marker::TRUE } else { marker::FALSE });
+        self.buf.put_u8(if value {
+            Marker::True.to_byte()
+        } else {
+            Marker::False.to_byte()
+        });
     }
 
     /// Auto-selects minimal encoding: TINY_INT (-16..=127, 1 byte),
     /// INT8 (-128..=-17), INT16, INT32, INT64.
     pub fn write_int(&mut self, value: i64) {
-        if (marker::TINY_INT_MIN as i64..=marker::TINY_INT_MAX as i64).contains(&value) {
+        if (-16..=127).contains(&value) {
             // TINY_INT: the value itself is the marker byte (as i8 cast to u8)
-            self.buf.put_u8(value as u8);
+            self.buf.put_u8(Marker::TinyInt(value as i8).to_byte());
         } else if (i8::MIN as i64..=i8::MAX as i64).contains(&value) {
-            self.buf.put_u8(marker::INT8);
+            self.buf.put_u8(Marker::Int8.to_byte());
             self.buf.put_i8(value as i8);
         } else if (i16::MIN as i64..=i16::MAX as i64).contains(&value) {
-            self.buf.put_u8(marker::INT16);
+            self.buf.put_u8(Marker::Int16.to_byte());
             self.buf.put_i16(value as i16);
         } else if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
-            self.buf.put_u8(marker::INT32);
+            self.buf.put_u8(Marker::Int32.to_byte());
             self.buf.put_i32(value as i32);
         } else {
-            self.buf.put_u8(marker::INT64);
+            self.buf.put_u8(Marker::Int64.to_byte());
             self.buf.put_i64(value);
         }
     }
 
     pub fn write_float(&mut self, value: f64) {
-        self.buf.put_u8(marker::FLOAT64);
+        self.buf.put_u8(Marker::Float64.to_byte());
         self.buf.put_f64(value);
     }
 
@@ -60,47 +63,57 @@ impl PackStreamWriter {
     pub fn write_bytes(&mut self, b: &[u8]) {
         let len = b.len();
         if len <= u8::MAX as usize {
-            self.buf.put_u8(marker::BYTES8);
+            self.buf.put_u8(Marker::Bytes8.to_byte());
             self.buf.put_u8(len as u8);
         } else if len <= u16::MAX as usize {
-            self.buf.put_u8(marker::BYTES16);
+            self.buf.put_u8(Marker::Bytes16.to_byte());
             self.buf.put_u16(len as u16);
         } else {
-            self.buf.put_u8(marker::BYTES32);
+            self.buf.put_u8(Marker::Bytes32.to_byte());
             self.buf.put_u32(len as u32);
         }
         self.buf.extend_from_slice(b);
     }
 
     pub fn write_list_header(&mut self, size: usize) {
-        self.write_sized_header(
-            size,
-            marker::TINY_LIST_NIBBLE,
-            marker::LIST8,
-            marker::LIST16,
-            marker::LIST32,
-        );
+        if size < 16 {
+            self.buf.put_u8(Marker::TinyList(size as u8).to_byte());
+        } else if size <= u8::MAX as usize {
+            self.buf.put_u8(Marker::List8.to_byte());
+            self.buf.put_u8(size as u8);
+        } else if size <= u16::MAX as usize {
+            self.buf.put_u8(Marker::List16.to_byte());
+            self.buf.put_u16(size as u16);
+        } else {
+            self.buf.put_u8(Marker::List32.to_byte());
+            self.buf.put_u32(size as u32);
+        }
     }
 
     pub fn write_map_header(&mut self, size: usize) {
-        self.write_sized_header(
-            size,
-            marker::TINY_MAP_NIBBLE,
-            marker::MAP8,
-            marker::MAP16,
-            marker::MAP32,
-        );
+        if size < 16 {
+            self.buf.put_u8(Marker::TinyMap(size as u8).to_byte());
+        } else if size <= u8::MAX as usize {
+            self.buf.put_u8(Marker::Map8.to_byte());
+            self.buf.put_u8(size as u8);
+        } else if size <= u16::MAX as usize {
+            self.buf.put_u8(Marker::Map16.to_byte());
+            self.buf.put_u16(size as u16);
+        } else {
+            self.buf.put_u8(Marker::Map32.to_byte());
+            self.buf.put_u32(size as u32);
+        }
     }
 
     pub fn write_struct_header(&mut self, tag: u8, num_fields: usize) {
         if num_fields < 16 {
             self.buf
-                .put_u8(marker::TINY_STRUCT_NIBBLE | num_fields as u8);
+                .put_u8(Marker::TinyStruct(num_fields as u8).to_byte());
         } else if num_fields <= u8::MAX as usize {
-            self.buf.put_u8(marker::STRUCT8);
+            self.buf.put_u8(Marker::Struct8.to_byte());
             self.buf.put_u8(num_fields as u8);
         } else {
-            self.buf.put_u8(marker::STRUCT16);
+            self.buf.put_u8(Marker::Struct16.to_byte());
             self.buf.put_u16(num_fields as u16);
         }
         self.buf.put_u8(tag);
@@ -120,31 +133,16 @@ impl PackStreamWriter {
 
     fn write_string_header(&mut self, len: usize) {
         if len < 16 {
-            self.buf.put_u8(marker::TINY_STRING_NIBBLE | len as u8);
+            self.buf.put_u8(Marker::TinyString(len as u8).to_byte());
         } else if len <= u8::MAX as usize {
-            self.buf.put_u8(marker::STRING8);
+            self.buf.put_u8(Marker::String8.to_byte());
             self.buf.put_u8(len as u8);
         } else if len <= u16::MAX as usize {
-            self.buf.put_u8(marker::STRING16);
+            self.buf.put_u8(Marker::String16.to_byte());
             self.buf.put_u16(len as u16);
         } else {
-            self.buf.put_u8(marker::STRING32);
+            self.buf.put_u8(Marker::String32.to_byte());
             self.buf.put_u32(len as u32);
-        }
-    }
-
-    fn write_sized_header(&mut self, size: usize, tiny: u8, m8: u8, m16: u8, m32: u8) {
-        if size < 16 {
-            self.buf.put_u8(tiny | size as u8);
-        } else if size <= u8::MAX as usize {
-            self.buf.put_u8(m8);
-            self.buf.put_u8(size as u8);
-        } else if size <= u16::MAX as usize {
-            self.buf.put_u8(m16);
-            self.buf.put_u16(size as u16);
-        } else {
-            self.buf.put_u8(m32);
-            self.buf.put_u32(size as u32);
         }
     }
 }
