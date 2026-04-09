@@ -30,7 +30,7 @@ falkordb-bolt-rs/
 │   │   ├── marker.rs             # PackStream marker byte constants
 │   │   ├── serialize.rs          # PackStream write (serialization)
 │   │   ├── deserialize.rs        # PackStream read (deserialization)
-│   │   └── value.rs              # BoltValue enum
+│   │   └── types.rs              # PackStream type tag constants
 │   ├── protocol/
 │   │   ├── mod.rs
 │   │   ├── message.rs            # Request/Response message enums
@@ -78,89 +78,138 @@ cbindgen = "0.28"   # Generate C headers from Rust FFI
 
 ### Serialization: No serde
 
-PackStream serialization is implemented manually (direct byte manipulation) via `PackStreamWriter`/`PackStreamReader`. No serde dependency. This matches the C implementation's approach, avoids data model mismatches (PackStream's tagged structs, positional fields, and multi-width integers don't map well to serde's model), and preserves the streaming writer pattern needed for the C FFI. Debug output uses `Debug`/`Display` trait implementations on `BoltValue` and message types.
+PackStream serialization is implemented manually (direct byte manipulation) via `PackStreamWriter`/`PackStreamReader`. No serde dependency. This matches the C implementation's approach, avoids data model mismatches (PackStream's tagged structs, positional fields, and multi-width integers don't map well to serde's model), and preserves the streaming writer pattern needed for the C FFI.
+
+### Zero-Copy Design Principle
+
+The crate has **no intermediate value type**. Both read and write paths operate directly on byte buffers via the streaming `PackStreamWriter`/`PackStreamReader` API.
+
+#### Where copies happen and how we eliminate them
+
+There are 4 data flow paths. Each is analyzed for copies:
+
+```
+PATH 1: Client → Server (reading incoming messages)
+─────────────────────────────────────────────────────
+Wire bytes → de-chunk → contiguous message buffer
+                              │
+                     PackStreamReader borrows from this buffer
+                              │
+                     ┌────────┴────────────┐
+                     │                      │
+              Rust (BoltHandler)      C (FFI callback)
+              Reader returns &str     Raw PackStream bytes
+              borrowed from buffer    passed as (ptr, len)
+              Nothing parsed upfront  C parses with bolt_read_*
+              for scalar fields       directly from buffer
+```
+
+**Reading (wire → host)**: The `ChunkDecoder` produces a contiguous `BytesMut` message buffer. The `PackStreamReader` borrows from this buffer — `read_string()` returns `&'a str` (zero-copy slice into the buffer). For the Rust API, the `BoltHandler` trait receives borrowed references. For the C API, the raw PackStream bytes are passed as `(ptr, len)` and the host uses `bolt_read_*` functions to parse directly — identical to the existing C pattern.
+
+**When copies are unavoidable on read**: If the handler needs to store a value beyond the lifetime of the message buffer (e.g., stash query text for logging), it must explicitly `.to_owned()`. This is the caller's choice, not forced by the crate.
+
+```
+PATH 2: Server → Client (writing outgoing messages)
+─────────────────────────────────────────────────────
+                     ┌────────────────────────────┐
+                     │                              │
+              Rust (BoltHandler)              C (FFI)
+              conn.write_string(&str)         bolt_reply_string(ptr, len)
+              conn.write_int(i64)             bolt_reply_int(i64)
+              Directly into BytesMut          Directly into BytesMut
+              No intermediate types           No intermediate types
+                     │                              │
+                     └──────────┬───────────────────┘
+                                │
+                     PackStreamWriter encodes
+                     directly into connection write buffer
+                                │
+                         chunk → wire
+```
+
+**Writing (host → wire)**: Both paths write directly into the connection's `BytesMut` write buffer via `PackStreamWriter`. The `bolt_reply_*` FFI functions and `conn.write_*` Rust methods encode PackStream markers + data in-place. No intermediate types constructed. This matches the existing C implementation's approach exactly.
+
+```
+PATH 3: Execution → QueryBuffer (buffered records)
+───────────────────────────────────────────────────
+              ┌────────────────────────────┐
+              │                              │
+       Rust (value_to_bolt)            C (bolt_reply_si_value)
+       write_runtime_value()          bolt_reply_*(client, ...)
+       into buffer via writer          routes to buffer when
+       No intermediate copy            inside record_begin/end
+              │                              │
+              └──────────┬───────────────────┘
+                         │
+              Pre-serialized bytes stored in
+              QueryBuffer.records (VecDeque<BytesMut>)
+```
+
+**Buffered records**: Records are serialized directly into pre-built PackStream bytes in the `QueryBuffer`. When PULL drains them, the bytes are `memcpy`'d to the connection's write buffer — no deserialization/re-serialization.
+
+```
+PATH 4: QueryBuffer → Client (PULL draining)
+─────────────────────────────────────────────
+QueryBuffer.records.pop_front() → pre-serialized BytesMut
+              │
+    conn.write_buf.extend_from_slice(record_bytes)
+              │
+    Already PackStream — just copy raw bytes to wire.
+    No parsing, no deserialization, just memcpy.
+```
+
+#### No intermediate value type
+
+There is **no intermediate value enum** in the crate. Both read and write paths use the streaming API directly:
+- **Writing**: Host calls `conn.write_int()`, `conn.write_string()`, `conn.write_node_header()` etc. to encode values directly into the buffer.
+- **Reading**: Host reads with `reader.read_int()`, `reader.read_string()` (borrowed `&str`), `reader.skip_value()` etc. directly from the buffer.
+
+The host application's own value types (e.g., `Value` in falkordb-rs-next-gen, `SIValue` in FalkorDB C) are serialized/deserialized directly to/from PackStream bytes without any intermediate representation.
 
 ---
 
 ### Layer 1: PackStream
 
-#### `packstream/value.rs` - BoltValue enum
+#### `packstream/types.rs` - Type tag constants
 
 ```rust
-/// All values that can be represented in the Bolt protocol.
-/// Maps to PackStream types + Bolt structure semantics.
-pub enum BoltValue {
+/// PackStream value type tags (for bolt_read_type / type inspection).
+pub enum PackStreamType {
     Null,
-    Boolean(bool),
-    Integer(i64),
-    Float(f64),
-    Bytes(Vec<u8>),
-    String(String),
-    List(Vec<BoltValue>),
-    Map(Vec<(String, BoltValue)>),   // Ordered key-value pairs
-
-    // Graph structures (Bolt structure tags)
-    Node(BoltNode),
-    Relationship(BoltRelationship),
-    UnboundRelationship(BoltUnboundRelationship),
-    Path(BoltPath),
-
-    // Temporal structures
-    Date(BoltDate),
-    Time(BoltTime),
-    LocalTime(BoltLocalTime),
-    DateTime(BoltDateTime),
-    DateTimeZoneId(BoltDateTimeZoneId),
-    LocalDateTime(BoltLocalDateTime),
-    Duration(BoltDuration),
-
-    // Spatial structures
-    Point2D(BoltPoint2D),
-    Point3D(BoltPoint3D),
+    Boolean,
+    Integer,
+    Float,
+    Bytes,
+    String,
+    List,
+    Map,
+    Struct,
 }
 
-pub struct BoltNode {
-    pub id: i64,
-    pub labels: Vec<String>,
-    pub properties: Vec<(String, BoltValue)>,
-    // element_id is derived from id: format!("node_{}", id)
-    // Generated by the crate during serialization, not stored.
+/// Bolt structure tags for graph entities and temporal/spatial types.
+pub mod struct_tag {
+    pub const NODE: u8 = 0x4E;
+    pub const RELATIONSHIP: u8 = 0x52;
+    pub const UNBOUND_RELATIONSHIP: u8 = 0x72;
+    pub const PATH: u8 = 0x50;
+    pub const POINT_2D: u8 = 0x58;
+    pub const POINT_3D: u8 = 0x59;
+    pub const DATE: u8 = 0x44;
+    pub const TIME: u8 = 0x54;
+    pub const LOCAL_TIME: u8 = 0x74;
+    pub const DATE_TIME: u8 = 0x49;
+    pub const DATE_TIME_ZONE_ID: u8 = 0x69;
+    pub const LOCAL_DATE_TIME: u8 = 0x64;
+    pub const DURATION: u8 = 0x45;
 }
-
-pub struct BoltRelationship {
-    pub id: i64,
-    pub start_node_id: i64,
-    pub end_node_id: i64,
-    pub rel_type: String,
-    pub properties: Vec<(String, BoltValue)>,
-    // element_id derived from id: format!("relationship_{}", id)
-    // start_node_element_id derived: format!("node_{}", start_node_id)
-    // end_node_element_id derived: format!("node_{}", end_node_id)
-    // All generated by the crate during serialization, not stored.
-}
-
-pub struct BoltUnboundRelationship {
-    pub id: i64,
-    pub rel_type: String,
-    pub properties: Vec<(String, BoltValue)>,
-    // element_id derived from id: format!("relationship_{}", id)
-    // Generated by the crate during serialization, not stored.
-}
-
-pub struct BoltPath {
-    pub nodes: Vec<BoltNode>,
-    pub relationships: Vec<BoltUnboundRelationship>,
-    pub indices: Vec<i64>,
-}
-
-// Similar structs for temporal/spatial (fields matching Bolt spec)
 ```
 
 #### `packstream/serialize.rs` - Writer
 
 ```rust
-/// Writes PackStream-encoded data to a byte buffer.
+/// Writes PackStream-encoded data directly to a byte buffer.
 /// Streaming API: call methods sequentially to build messages.
+/// All writes go directly into the buffer — no intermediate value types.
 pub struct PackStreamWriter {
     buf: BytesMut,
 }
@@ -171,14 +220,11 @@ impl PackStreamWriter {
     pub fn write_bool(&mut self, value: bool);
     pub fn write_int(&mut self, value: i64);      // Auto-selects TINY/8/16/32/64
     pub fn write_float(&mut self, value: f64);
-    pub fn write_string(&mut self, value: &str);
-    pub fn write_bytes(&mut self, value: &[u8]);
+    pub fn write_string(&mut self, value: &str);   // Borrows, no copy of input
+    pub fn write_bytes(&mut self, value: &[u8]);   // Borrows, no copy of input
     pub fn write_list_header(&mut self, size: u32);
     pub fn write_map_header(&mut self, size: u32);
     pub fn write_struct_header(&mut self, tag: u8, size: u32);
-
-    /// Write a complete BoltValue (recursive)
-    pub fn write_value(&mut self, value: &BoltValue);
 
     pub fn into_bytes(self) -> BytesMut;
     pub fn as_bytes(&self) -> &[u8];
@@ -186,10 +232,13 @@ impl PackStreamWriter {
 }
 ```
 
-#### `packstream/deserialize.rs` - Reader
+#### `packstream/deserialize.rs` - Reader (zero-copy)
 
 ```rust
 /// Reads PackStream-encoded data from a byte buffer.
+/// Returns borrowed references where possible (zero-copy for strings/bytes).
+/// The lifetime 'a ties returned references to the buffer — they are valid
+/// as long as the underlying message buffer is alive.
 pub struct PackStreamReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -197,18 +246,34 @@ pub struct PackStreamReader<'a> {
 
 impl<'a> PackStreamReader<'a> {
     pub fn new(data: &'a [u8]) -> Self;
-    pub fn read_value(&mut self) -> Result<BoltValue, PackStreamError>;
+
+    // --- Zero-copy reads (return references into buffer) ---
+    pub fn read_string(&mut self) -> Result<&'a str, PackStreamError>;
+    pub fn read_bytes(&mut self) -> Result<&'a [u8], PackStreamError>;
+
+    // --- Scalar reads (copy by value, cheap) ---
     pub fn read_null(&mut self) -> Result<(), PackStreamError>;
     pub fn read_bool(&mut self) -> Result<bool, PackStreamError>;
     pub fn read_int(&mut self) -> Result<i64, PackStreamError>;
     pub fn read_float(&mut self) -> Result<f64, PackStreamError>;
-    pub fn read_string(&mut self) -> Result<&'a str, PackStreamError>;
+
+    // --- Container header reads (no data copy, just size) ---
     pub fn read_list_header(&mut self) -> Result<u32, PackStreamError>;
     pub fn read_map_header(&mut self) -> Result<u32, PackStreamError>;
     pub fn read_struct_header(&mut self) -> Result<(u8, u32), PackStreamError>;
+
+    // --- Skip (advance past a value without reading it) ---
+    pub fn skip_value(&mut self) -> Result<(), PackStreamError>;
+
     pub fn remaining(&self) -> usize;
 }
 ```
+
+**Key design decisions for the reader:**
+
+1. **`read_string()` returns `&'a str`** — zero-copy reference into the message buffer. PackStream strings are length-prefixed, so the reader knows the exact byte range. Since `ChunkDecoder` produces contiguous `BytesMut`, the string is always a valid contiguous slice.
+
+2. **`skip_value()`** — advances the cursor past a value without allocating anything. Used when the handler doesn't need certain fields (e.g., skipping notification_filter in RUN extras).
 
 ---
 
@@ -218,92 +283,107 @@ impl<'a> PackStreamReader<'a> {
 
 ```rust
 /// Messages sent by the client.
-/// Each variant has strongly-typed fields. Optional/version-gated fields use Option<T>.
-/// The parser populates fields based on negotiated version.
-pub enum BoltRequest {
-    Hello(HelloMessage),
-    Logon(LogonMessage),          // 5.1+
+/// Lifetime 'a borrows from the message buffer — string fields are zero-copy
+/// references into the de-chunked buffer, not owned allocations.
+pub enum BoltRequest<'a> {
+    Hello(HelloMessage<'a>),
+    Logon(LogonMessage<'a>),      // 5.1+
     Logoff,                       // 5.1+
-    Run(RunMessage),
+    Run(RunMessage<'a>),
     Pull(PullMessage),
     Discard(DiscardMessage),
-    Begin(BeginMessage),
+    Begin(BeginMessage<'a>),
     Commit,
     Rollback,
     Reset,
-    Route(RouteMessage),
+    Route(RouteMessage<'a>),
     Telemetry(TelemetryMessage),  // 5.4+
     Goodbye,
 }
 
 /// HELLO (0x01) - Connection initialization.
-/// The parser reads the extra map and populates typed fields.
-pub struct HelloMessage {
-    pub user_agent: String,
-    pub bolt_agent: Option<BoltAgent>,            // 5.3+
-    pub routing: Option<BoltValue>,               // Optional routing context
-    pub patch_bolt: Vec<String>,                   // Patch negotiation
-    pub notification_filter: Option<NotificationFilter>,  // 5.2+
+/// String fields borrow from the message buffer.
+pub struct HelloMessage<'a> {
+    pub user_agent: &'a str,
+    pub bolt_agent: Option<BoltAgent<'a>>,            // 5.3+
+    pub routing: Option<PackStreamSlice<'a>>,          // Raw PackStream bytes for routing context
+    pub patch_bolt: Vec<&'a str>,                      // Patch negotiation
+    // notification_filter is skipped (not needed by handler)
 }
 
-pub struct BoltAgent {
-    pub product: String,
-    pub platform: Option<String>,
-    pub language: Option<String>,
-    pub language_details: Option<String>,
+pub struct BoltAgent<'a> {
+    pub product: &'a str,
+    pub platform: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub language_details: Option<&'a str>,
 }
 
 /// LOGON (0x6A) - Authentication (5.1+).
-pub struct LogonMessage {
-    pub scheme: String,              // "basic", "bearer", "kerberos", "none"
-    pub principal: Option<String>,   // Username (basic/kerberos)
-    pub credentials: Option<String>, // Password/token
-    pub realm: Option<String>,       // Multi-realm support
+pub struct LogonMessage<'a> {
+    pub scheme: &'a str,              // "basic", "bearer", "kerberos", "none"
+    pub principal: Option<&'a str>,   // Username (basic/kerberos)
+    pub credentials: Option<&'a str>, // Password/token
+    pub realm: Option<&'a str>,       // Multi-realm support
 }
 
 /// RUN (0x10) - Execute query.
-pub struct RunMessage {
-    pub query: String,
-    pub parameters: Vec<(String, BoltValue)>,
-    pub extra: RunExtra,
+/// query borrows from buffer. Parameters and extras are passed as raw
+/// PackStream slices — the handler parses only what it needs.
+pub struct RunMessage<'a> {
+    pub query: &'a str,                     // Zero-copy from buffer
+    pub parameters: PackStreamSlice<'a>,    // Raw PackStream bytes (map)
+    pub extra: RunExtra<'a>,
+}
+
+/// PackStream slice — a reference to raw PackStream-encoded data in the buffer.
+/// Avoids parsing nested structures that the handler may not need.
+/// Provides a reader() method for on-demand zero-copy parsing.
+pub struct PackStreamSlice<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PackStreamSlice<'a> {
+    /// Create a reader to parse this slice on demand (zero-copy).
+    pub fn reader(&self) -> PackStreamReader<'a>;
+
+    /// Get the raw bytes (for C FFI passthrough).
+    pub fn as_bytes(&self) -> &'a [u8];
+
+    pub fn len(&self) -> usize;
 }
 
 /// Typed extra fields for RUN/BEGIN.
-/// Optional fields are None when not provided or when version doesn't support them.
-pub struct RunExtra {
-    pub bookmarks: Vec<String>,
-    pub tx_timeout: Option<i64>,       // Milliseconds
-    pub tx_metadata: Option<BoltValue>,
-    pub mode: Option<String>,          // "r" or "w"
-    pub db: Option<String>,            // Target database name
-    pub imp_user: Option<String>,      // Impersonated user
-    pub notification_filter: Option<NotificationFilter>,  // 5.2+
+/// String fields borrow from buffer. Complex fields use PackStreamSlice
+/// so they're only parsed if the handler needs them.
+pub struct RunExtra<'a> {
+    pub db: Option<&'a str>,            // Target database name (most commonly needed)
+    pub mode: Option<&'a str>,          // "r" or "w"
+    pub tx_timeout: Option<i64>,        // Milliseconds
+    pub imp_user: Option<&'a str>,      // Impersonated user
+    pub bookmarks: Option<PackStreamSlice<'a>>,    // Parsed on demand
+    pub tx_metadata: Option<PackStreamSlice<'a>>,  // Parsed on demand
+    // notification_filter skipped (not needed by handler)
 }
 
 pub struct PullMessage { pub n: i64, pub qid: i64 }
 pub struct DiscardMessage { pub n: i64, pub qid: i64 }
-pub struct BeginMessage { pub extra: RunExtra }  // Same extra fields as RUN
-pub struct RouteMessage {
-    pub routing: BoltValue,
-    pub bookmarks: Vec<String>,
-    pub db: Option<String>,
+pub struct BeginMessage<'a> { pub extra: RunExtra<'a> }
+pub struct RouteMessage<'a> {
+    pub routing: PackStreamSlice<'a>,
+    pub bookmarks: Option<PackStreamSlice<'a>>,
+    pub db: Option<&'a str>,
 }
 pub struct TelemetryMessage { pub api: i64 }
 
-/// Messages sent by the server.
-/// Success/Failure have typed metadata for common response patterns.
-pub enum BoltResponse {
-    Success { metadata: Vec<(String, BoltValue)> },
-    Failure { code: String, message: String },
-    Ignored,
-    Record { fields: Vec<BoltValue> },
-}
+/// No BoltResponse enum — responses are written directly to the connection's
+/// write buffer via conn.write_success_header(), conn.write_failure(), etc.
 
-/// Parsing: version-aware deserialization.
-/// Each message parser reads the PackStream struct fields and maps them to typed fields.
-/// Version-gated fields are skipped/ignored if the negotiated version doesn't support them.
-impl BoltRequest {
-    pub fn parse(reader: &mut PackStreamReader, version: BoltVersion) -> Result<Self, BoltError> {
+/// Parsing: version-aware, zero-copy deserialization.
+/// String fields are borrowed from the message buffer.
+/// Complex nested structures (parameters, bookmarks, metadata) are captured as
+/// PackStreamSlice references — only parsed on demand by the handler.
+impl<'a> BoltRequest<'a> {
+    pub fn parse(reader: &mut PackStreamReader<'a>, version: BoltVersion) -> Result<Self, BoltError> {
         let (tag, _size) = reader.read_struct_header()?;
         match tag {
             0x01 => Ok(BoltRequest::Hello(HelloMessage::parse(reader, version)?)),
@@ -316,16 +396,13 @@ impl BoltRequest {
     }
 }
 
-/// Response serialization: version-aware.
-/// The writer serializes typed response structs into PackStream, respecting version constraints.
-impl BoltResponse {
-    pub fn write(&self, writer: &mut PackStreamWriter, version: BoltVersion) { /* ... */ }
-}
+/// Responses: written directly via conn.write_success_header(),
+/// conn.write_failure(), conn.write_ignored(). No response enum needed.
 ```
 
-Parsing: `BoltRequest::parse(reader: &mut PackStreamReader) -> Result<BoltRequest>` reads the struct tag and dispatches to the correct variant.
+Parsing: `BoltRequest::parse(reader)` reads struct tag and dispatches. String fields are borrowed from the buffer. Nested structures (parameters, extras) are captured as `PackStreamSlice` — raw byte references that can be parsed on demand.
 
-Serialization: `BoltResponse::write(writer: &mut PackStreamWriter)` writes the struct tag + fields.
+Serialization: Responses are written directly via `conn.write_success()`, `conn.write_failure()`, etc. No intermediate `BoltResponse` enum is constructed during normal operation.
 
 #### `protocol/state.rs` - Connection State Machine
 
@@ -422,33 +499,42 @@ impl ChunkDecoder {
 ```rust
 /// Trait that the host application implements to handle Bolt commands.
 /// This is the main integration point for FalkorDB / falkordb-rs-next-gen.
+///
+/// Zero-copy design: String arguments borrow from the message buffer.
+/// The handler must not store these references beyond the method call.
+/// If the handler needs to keep data (e.g., query text for logging),
+/// it must explicitly call .to_owned() / .to_string().
+///
+/// Complex nested data (parameters, extras) are passed as PackStreamSlice —
+/// raw PackStream bytes that the handler can parse on demand using .reader().
 pub trait BoltHandler: Send + Sync {
-    /// Called on HELLO message. Return metadata map for SUCCESS response.
+    /// Called on HELLO message.
+    /// Write SUCCESS metadata directly to conn.
     fn hello(
         &self,
         conn: &mut BoltConnection,
-        extra: &BoltValue,
-    ) -> Result<Vec<(String, BoltValue)>, BoltError>;
+        msg: &HelloMessage<'_>,
+    ) -> Result<(), BoltError>;
 
     /// Called on LOGON message. Return Ok(()) for success, Err for failure.
     fn authenticate(
         &self,
         conn: &mut BoltConnection,
-        auth: &BoltValue,
+        msg: &LogonMessage<'_>,
     ) -> Result<(), BoltError>;
 
     /// Called on RUN message. Should execute the query and prepare results.
-    /// Return SUCCESS metadata (fields, t_first, qid).
+    /// The handler writes SUCCESS metadata directly to conn (fields, qid, t_first
+    /// are added by the crate). Parameters and extras are PackStreamSlice —
+    /// parse on demand with .reader() instead of pre-parsing everything.
     fn run(
         &self,
         conn: &mut BoltConnection,
-        query: &str,
-        parameters: &[(String, BoltValue)],
-        extra: &[(String, BoltValue)],
-    ) -> Result<Vec<(String, BoltValue)>, BoltError>;
+        msg: &RunMessage<'_>,
+    ) -> Result<(), BoltError>;
 
     /// PULL is handled internally by the crate - it drains pre-serialized
-    /// RECORDs from the MessageBuffer. No host callback needed.
+    /// RECORDs from the QueryBuffer. No host callback needed.
 
     /// DISCARD is handled internally by the crate - it discards buffered
     /// RECORDs without sending them. No host callback needed.
@@ -457,7 +543,7 @@ pub trait BoltHandler: Send + Sync {
     fn begin(
         &self,
         conn: &mut BoltConnection,
-        extra: &[(String, BoltValue)],
+        msg: &BeginMessage<'_>,
     ) -> Result<(), BoltError>;
 
     /// Called on COMMIT.
@@ -470,10 +556,8 @@ pub trait BoltHandler: Send + Sync {
     fn route(
         &self,
         conn: &mut BoltConnection,
-        routing: &BoltValue,
-        bookmarks: &[String],
-        extra: &[(String, BoltValue)],
-    ) -> Result<Vec<(String, BoltValue)>, BoltError>;
+        msg: &RouteMessage<'_>,
+    ) -> Result<(), BoltError>;
 
     /// Called on RESET message.
     fn reset(&self, conn: &mut BoltConnection) -> Result<(), BoltError>;
@@ -502,17 +586,43 @@ pub struct BoltConnection {
 }
 
 impl BoltConnection {
-    /// Write a SUCCESS response with metadata.
-    pub fn write_success(&mut self, metadata: &[(String, BoltValue)]);
+    // --- Message-level writers (protocol framing) ---
+
+    /// Write a SUCCESS response header. Caller then writes metadata key-value pairs.
+    pub fn write_success_header(&mut self, metadata_count: u32);
 
     /// Write a FAILURE response.
     pub fn write_failure(&mut self, code: &str, message: &str);
 
-    /// Write a RECORD response (one result row).
-    pub fn write_record(&mut self, fields: &[BoltValue]);
+    /// Write a RECORD header. Caller then writes field values.
+    pub fn write_record_header(&mut self, field_count: u32);
 
     /// Write an IGNORED response.
     pub fn write_ignored(&mut self);
+
+    // --- Streaming PackStream writers (zero-copy, direct to buffer) ---
+    // These write directly into the current target buffer (connection write_buf
+    // or QueryBuffer, depending on context).
+
+    pub fn write_null(&mut self);
+    pub fn write_bool(&mut self, value: bool);
+    pub fn write_int(&mut self, value: i64);
+    pub fn write_float(&mut self, value: f64);
+    pub fn write_string(&mut self, value: &str);    // Borrows, encodes in-place
+    pub fn write_bytes(&mut self, value: &[u8]);
+    pub fn write_list_header(&mut self, size: u32);
+    pub fn write_map_header(&mut self, size: u32);
+    pub fn write_struct_header(&mut self, tag: u8, size: u32); // For temporal/spatial types
+
+    // --- High-level entity writers (zero-copy) ---
+    // Write struct header + fixed fields. Caller then writes labels/properties.
+    pub fn write_node_header(&mut self, id: i64, label_count: u32, prop_count: u32);
+    pub fn write_relationship_header(&mut self, id: i64, start_id: i64, end_id: i64,
+        rel_type: &str, prop_count: u32);
+    pub fn write_unbound_relationship_header(&mut self, id: i64, rel_type: &str, prop_count: u32);
+    pub fn write_path_header(&mut self, node_count: u32, rel_count: u32, index_count: u32);
+    pub fn write_point2d(&mut self, srid: i64, x: f64, y: f64);
+
 
     /// End current message (write zero-chunk terminator).
     pub fn end_message(&mut self);
@@ -520,8 +630,15 @@ impl BoltConnection {
     /// Get raw bytes ready to send to the socket.
     pub fn take_write_bytes(&mut self) -> BytesMut;
 
-    /// Feed raw bytes received from socket. Returns parsed requests.
-    pub fn feed_data(&mut self, data: &[u8]) -> Result<Vec<BoltRequest>, BoltError>;
+    /// Feed raw bytes received from socket. De-chunks into complete messages.
+    pub fn feed_data(&mut self, data: &[u8]) -> Result<(), BoltError>;
+
+    /// Check if there are complete messages ready for processing.
+    pub fn has_pending_messages(&self) -> bool;
+
+    /// Process the next complete message through the handler.
+    /// The message is parsed with borrowed references into the internal buffer.
+    /// The buffer is valid until the next feed_data() call.
 
     /// Process a single request through the handler, updating state.
     /// If state is INTERRUPTED, all messages except RESET/GOODBYE get IGNORED.
@@ -566,7 +683,7 @@ pub fn bolt_accept(listen_fd: i32) -> Result<Box<BoltConnection>, BoltError>;
 
 ### Layer 3.5: Record Serialization - Entity Resolution Strategy
 
-**Principle**: The Bolt crate has NO knowledge of graphs, schemas, or IDs. It receives fully-resolved `BoltValue`s from the host app. The host is responsible for resolving bare IDs into full Bolt entities.
+**Principle**: The Bolt crate has NO knowledge of graphs, schemas, or IDs. The host app resolves IDs and writes fully-resolved entities directly to the buffer using the streaming writer API.
 
 #### Bolt expects fully-materialized compound objects:
 
@@ -609,109 +726,113 @@ Path(0x50, 3 fields):
 | `Edge { id, src_id, dest_id, relationID, *attributes }` | `Value::Relationship(Box<(RelId, NodeId, NodeId)>)` | Type name requires Schema lookup; properties require graph query |
 | `Path { *nodes, *edges }` | `Value::Path(ThinVec<Value>)` | Each node/edge inside needs full resolution |
 
-#### Resolution responsibility: HOST resolves, crate receives `BoltValue`
+#### Resolution responsibility: HOST resolves, crate writes directly
 
-The host app (FalkorDB C or Rust) resolves IDs before passing values to the Bolt crate:
+The host app (FalkorDB C or Rust) resolves IDs and writes values directly to the buffer using the streaming writer. No intermediate value types are created.
 
-**In FalkorDB Rust (next-gen)** - `value_to_bolt()` in `src/bolt.rs`:
+**In FalkorDB Rust (next-gen)** - `write_runtime_value()` in `src/bolt.rs`:
 ```rust
-fn value_to_bolt(runtime: &Runtime, value: Value) -> BoltValue {
+/// Write a runtime Value directly to the connection buffer.
+/// Data flows directly: graph → writer buffer. No intermediate types.
+fn write_runtime_value(conn: &mut BoltConnection, runtime: &Runtime, value: Value) {
     match value {
         Value::Node(id) => {
             let g = runtime.g.borrow();
-            // Check if node was deleted during this query
-            let dn = runtime.deleted_nodes.borrow();
-            if let Some(deleted) = dn.get(&id) {
-                BoltValue::Node(BoltNode {
-                    id: u64::from(id) as i64,
-                    labels: deleted.labels.iter()
-                        .map(|lid| g.get_label_name(*lid).to_string()).collect(),
-                    properties: deleted.attrs.iter()
-                        .map(|(k, v)| (k.to_string(), value_to_bolt(runtime, v.clone()))).collect(),
-                    // element_id generated by crate during serialization
-                })
-            } else {
-                BoltValue::Node(BoltNode {
-                    id: u64::from(id) as i64,
-                    labels: g.get_node_labels(id).map(|s| s.to_string()).collect(),
-                    properties: g.get_node_all_attrs(id).iter()
-                        .map(|(k, v)| (k.to_string(), value_to_bolt(runtime, v.clone()))).collect(),
-                    // element_id generated by crate during serialization
-                })
+            let labels: Vec<_> = g.get_node_labels(id).collect();
+            let attrs = g.get_node_all_attrs(id);
+            conn.write_node_header(u64::from(id) as i64, labels.len() as u32, attrs.len() as u32);
+            for label in &labels { conn.write_string(label); }
+            for (k, v) in &attrs {
+                conn.write_string(k);
+                write_runtime_value(conn, runtime, v.clone()); // recursive
             }
         }
         Value::Relationship(rel) => {
             let (rel_id, src, dst) = *rel;
             let g = runtime.g.borrow();
-            let dr = runtime.deleted_relationships.borrow();
-            let (type_name, props) = if let Some(deleted) = dr.get(&rel_id) {
-                (g.get_type_name(deleted.type_id).to_string(),
-                 deleted.attrs.iter().map(|(k,v)| (k.to_string(), value_to_bolt(runtime, v.clone()))).collect())
-            } else {
-                let tid = g.get_relationship_type_id(rel_id);
-                (g.get_type_name(tid).to_string(),
-                 g.get_relationship_all_attrs(rel_id).iter()
-                    .map(|(k,v)| (k.to_string(), value_to_bolt(runtime, v.clone()))).collect())
-            };
-            BoltValue::Relationship(BoltRelationship {
-                id: u64::from(rel_id) as i64,
-                start_node_id: u64::from(src) as i64,
-                end_node_id: u64::from(dst) as i64,
-                rel_type: type_name,
-                properties: props,
-                // element_id, start/end_node_element_id generated by crate during serialization
-            })
+            let tid = g.get_relationship_type_id(rel_id);
+            let type_name = g.get_type_name(tid);
+            let attrs = g.get_relationship_all_attrs(rel_id);
+            conn.write_relationship_header(
+                u64::from(rel_id) as i64,
+                u64::from(src) as i64,
+                u64::from(dst) as i64,
+                type_name, attrs.len() as u32,
+            );
+            for (k, v) in &attrs {
+                conn.write_string(k);
+                write_runtime_value(conn, runtime, v.clone());
+            }
         }
         Value::Path(values) => {
-            // Convert alternating [Node, Rel, Node, Rel, ..., Node] into Bolt Path
-            let mut nodes = Vec::new();
-            let mut rels = Vec::new();
-            let mut indices = Vec::new();
-            for (i, v) in values.iter().enumerate() {
-                if i % 2 == 0 {
-                    // Node
-                    if let BoltValue::Node(n) = value_to_bolt(runtime, v.clone()) {
-                        nodes.push(n);
-                    }
-                } else {
-                    // Relationship - convert to UnboundRelationship for Path
-                    if let BoltValue::Relationship(r) = value_to_bolt(runtime, v.clone()) {
-                        let node_before = &nodes[nodes.len() - 1];
-                        let idx = rels.len() as i64 + 1;
-                        // Direction: positive if forward (src matches prev node), negative if backward
-                        if r.start_node_id == node_before.id {
-                            indices.push(idx);
-                        } else {
-                            indices.push(-idx);
-                        }
-                        indices.push(nodes.len() as i64); // index of next node
-                        rels.push(BoltUnboundRelationship {
-                            id: r.id,
-                            rel_type: r.rel_type,
-                            properties: r.properties,
-                            element_id: r.element_id,
-                        });
+            // Path requires pre-counting nodes and edges
+            let node_count = (values.len() + 1) / 2;
+            let edge_count = values.len() / 2;
+            conn.write_path_header(node_count as u32, edge_count as u32, (edge_count * 2) as u32);
+            // Write nodes
+            for v in values.iter().step_by(2) {
+                write_runtime_value(conn, runtime, v.clone());
+            }
+            // Write unbound relationships
+            for v in values.iter().skip(1).step_by(2) {
+                if let Value::Relationship(rel) = v {
+                    let (rel_id, _, _) = **rel;
+                    let g = runtime.g.borrow();
+                    let tid = g.get_relationship_type_id(rel_id);
+                    let type_name = g.get_type_name(tid);
+                    let attrs = g.get_relationship_all_attrs(rel_id);
+                    conn.write_unbound_relationship_header(
+                        u64::from(rel_id) as i64, type_name, attrs.len() as u32,
+                    );
+                    for (k, v) in &attrs {
+                        conn.write_string(k);
+                        write_runtime_value(conn, runtime, v.clone());
                     }
                 }
             }
-            BoltValue::Path(BoltPath { nodes, relationships: rels, indices })
+            // Write traversal indices
+            // (direction logic based on src_id matching previous node)
         }
-        // Scalars pass through directly
-        Value::Null => BoltValue::Null,
-        Value::Bool(b) => BoltValue::Boolean(b),
-        Value::Int(i) => BoltValue::Integer(i),
-        Value::Float(f) => BoltValue::Float(f),
-        Value::String(s) => BoltValue::String(s.to_string()),
-        Value::List(l) => BoltValue::List(l.iter().map(|v| value_to_bolt(runtime, v.clone())).collect()),
-        Value::Map(m) => BoltValue::Map(m.iter().map(|(k,v)| (k.to_string(), value_to_bolt(runtime, v.clone()))).collect()),
-        Value::Point(p) => BoltValue::Point2D(BoltPoint2D { srid: 4326, x: p.longitude as f64, y: p.latitude as f64 }),
-        Value::VecF32(v) => BoltValue::List(v.iter().map(|f| BoltValue::Float(*f as f64)).collect()),
-        // Temporal types
-        Value::Datetime(ts) => BoltValue::DateTime(BoltDateTime { seconds: ts, nanoseconds: 0, tz_offset: 0 }),
-        Value::Date(d) => BoltValue::Date(BoltDate { days_since_epoch: d }),
-        Value::Time(t) => BoltValue::Time(BoltTime { nanoseconds: t, tz_offset: 0 }),
-        Value::Duration(d) => BoltValue::Duration(BoltDuration { months: 0, days: 0, seconds: d, nanoseconds: 0 }),
-        _ => BoltValue::Null,
+        // Scalars — write directly, no allocation
+        Value::Null => conn.write_null(),
+        Value::Bool(b) => conn.write_bool(b),
+        Value::Int(i) => conn.write_int(i),
+        Value::Float(f) => conn.write_float(f),
+        Value::String(s) => conn.write_string(&s),
+        Value::List(l) => {
+            conn.write_list_header(l.len() as u32);
+            for v in l.iter() { write_runtime_value(conn, runtime, v.clone()); }
+        }
+        Value::Map(m) => {
+            conn.write_map_header(m.len() as u32);
+            for (k, v) in m.iter() {
+                conn.write_string(k);
+                write_runtime_value(conn, runtime, v.clone());
+            }
+        }
+        Value::Point(p) => conn.write_point2d(4326, p.longitude as f64, p.latitude as f64),
+        Value::VecF32(v) => {
+            conn.write_list_header(v.len() as u32);
+            for f in v.iter() { conn.write_float(*f as f64); }
+        }
+        // Temporal types — write struct header + fields directly
+        Value::Datetime(ts) => {
+            conn.write_struct_header(struct_tag::DATE_TIME, 3);
+            conn.write_int(ts); conn.write_int(0); conn.write_int(0);
+        }
+        Value::Date(d) => {
+            conn.write_struct_header(struct_tag::DATE, 1);
+            conn.write_int(d);
+        }
+        Value::Time(t) => {
+            conn.write_struct_header(struct_tag::TIME, 2);
+            conn.write_int(t); conn.write_int(0);
+        }
+        Value::Duration(d) => {
+            conn.write_struct_header(struct_tag::DURATION, 4);
+            conn.write_int(0); conn.write_int(0); conn.write_int(d); conn.write_int(0);
+        }
+        _ => conn.write_null(),
     }
 }
 ```
@@ -721,35 +842,24 @@ fn value_to_bolt(runtime: &Runtime, value: Value) -> BoltValue {
 // Current C code in _ResultSet_BoltReplyWithNode already resolves:
 // - Labels via NODE_GET_LABELS() + Schema_GetName()
 // - Properties via GraphEntity_GetAttributes() + AttributeSet iteration
-// - element_id via sprintf("node_%lu", id)
-// This logic stays in C, but calls bolt_reply_node() from the Rust crate
-```
-
-**Then the Bolt crate just serializes `BoltValue` to PackStream:**
-```rust
-// Inside PackStreamWriter - no graph knowledge needed
-fn write_bolt_node(writer: &mut PackStreamWriter, node: &BoltNode) {
-    writer.write_struct_header(0x4E, 4);
-    writer.write_int(node.id);
-    writer.write_list_header(node.labels.len() as u32);
-    for label in &node.labels { writer.write_string(label); }
-    writer.write_map_header(node.properties.len() as u32);
-    for (k, v) in &node.properties { writer.write_string(k); writer.write_value(v); }
-    // element_id derived from integer id
-    writer.write_string(&format!("node_{}", node.id));
-}
+// This logic stays in C, calling bolt_reply_node() / bolt_reply_string() etc.
+// from the Rust crate. No intermediate value types on either side.
 ```
 
 ---
 
 ### Layer 4: C FFI API
 
+**Zero-copy in the C API:**
+- **Writing**: `bolt_reply_*` functions encode directly into the connection's write buffer. No intermediate types.
+- **Reading**: Callback arguments (`query`, `scheme`, `principal`, `credentials`) are pointers INTO the message buffer — zero-copy. `params_buf`/`extra_buf` are raw PackStream bytes that the C code parses on demand with `bolt_read_*` functions, which also return pointers into the buffer.
+- **Buffered records**: `bolt_buffer_record_begin/end` writes directly to the QueryBuffer. PULL copies pre-serialized bytes to the wire — no re-serialization.
+
 #### `ffi/c_api.rs`
 
 ```rust
 // --- Opaque handle types ---
 pub type BoltClient = *mut BoltConnection;
-pub type BoltValueHandle = *mut BoltValue;
 
 // --- Callback function pointer types for C ---
 pub type BoltAuthCallback = extern "C" fn(
@@ -883,11 +993,30 @@ pub type BoltRollbackCallback = extern "C" fn(conn: BoltClient, user_data: *mut 
 );  // starts 10s cleanup timer
 // PULL is handled internally by the crate (uses qid from PULL message to find buffer).
 
-// --- Read helpers (for parsing parameters in RUN callback) ---
+// --- Read helpers (zero-copy parsing of PackStream data) ---
+// These operate on the raw PackStream bytes passed to callbacks (params_buf, extra_buf).
+// The cursor (data) is advanced past each read. String reads return a pointer INTO
+// the original buffer — zero-copy, no allocation. The pointer is valid as long as
+// the callback is executing (the buffer is owned by the crate).
+//
+// Usage pattern in C:
+//   const uint8_t *cursor = params_buf;
+//   int type = bolt_read_type(cursor);
+//   if (type == BVT_STRING) {
+//       uint32_t len;
+//       const char *str = bolt_read_string_value(&cursor, &len);
+//       // str points into params_buf — zero-copy, valid during callback
+//   }
 #[no_mangle] pub extern "C" fn bolt_read_type(data: *const u8) -> i32;
 #[no_mangle] pub extern "C" fn bolt_read_int_value(data: *mut *const u8) -> i64;
+#[no_mangle] pub extern "C" fn bolt_read_float_value(data: *mut *const u8) -> f64;
+#[no_mangle] pub extern "C" fn bolt_read_bool_value(data: *mut *const u8) -> bool;
+// Returns pointer INTO the buffer (zero-copy). Valid during callback lifetime.
 #[no_mangle] pub extern "C" fn bolt_read_string_value(data: *mut *const u8, out_len: *mut u32) -> *const c_char;
-// ... etc. matching current C API patterns in FalkorDB
+#[no_mangle] pub extern "C" fn bolt_read_list_size(data: *mut *const u8) -> u32;
+#[no_mangle] pub extern "C" fn bolt_read_map_size(data: *mut *const u8) -> u32;
+// Skip past a value without reading it (for fields the handler doesn't need).
+#[no_mangle] pub extern "C" fn bolt_read_skip(data: *mut *const u8);
 ```
 
 The C API is designed to be a **near drop-in replacement** for the current `bolt_*` functions in FalkorDB's `src/bolt/bolt.h`, with the addition of callback registration. A `cbindgen`-generated header file will be produced at build time.
@@ -1311,13 +1440,16 @@ fn handle_pull(conn: &mut BoltConnection, registry: &QueryBufferRegistry,
     }
 
     if buffer.has_more() {
-        conn.write_success(&[("has_more".into(), BoltValue::Boolean(true))]);
+        conn.write_success_header(1);
+        conn.write_string("has_more");
+        conn.write_bool(true);
     } else if let Some(err) = buffer.take_error() {
         conn.write_failure(&err.code, &err.message);
         registry.remove(qid);  // cancel timer, free buffer
     } else {
-        let stats = buffer.take_stats().unwrap_or_default();
-        conn.write_success(&stats);
+        // Write stats as SUCCESS metadata (pre-serialized by buffer)
+        let stats_bytes = buffer.take_stats_bytes().unwrap_or_default();
+        conn.write_buf.extend_from_slice(&stats_bytes);
         registry.remove(qid);  // cancel timer, free buffer
     }
     conn.end_message();
@@ -1433,7 +1565,7 @@ void falkordb_run_handler(BoltClient client, const char *query, ...) {
 │                           │    │                                            │
 │ src/bolt.rs:              │    │ src/bolt_bridge.c:                         │
 │   FalkorBoltHandler impl  │    │   Callback implementations                │
-│   value_to_bolt()         │    │   bolt_reply_si_value() helper            │
+│   write_runtime_value()   │    │   bolt_reply_si_value() helper            │
 │                           │    │                                            │
 │ graph/ crate:             │    │ src/resultset/formatters/:                 │
 │   Runtime, Value enum     │    │   resultset_replybolt.c (uses FFI)        │
@@ -1940,24 +2072,24 @@ pub struct FalkorBoltHandler {
 }
 
 impl BoltHandler for FalkorBoltHandler {
-    fn authenticate(&self, conn: &mut BoltConnection, auth: &BoltValue) -> Result<(), BoltError> {
-        // Extract scheme/principal/credentials from auth map
+    fn authenticate(&self, conn: &mut BoltConnection, msg: &LogonMessage<'_>) -> Result<(), BoltError> {
+        // msg.scheme, msg.principal, msg.credentials are &str borrowed from buffer
         // Call Redis AUTH via the context if needed (pluggable)
     }
 
-    fn run(&self, conn: &mut BoltConnection, query: &str, params: &[(String, BoltValue)], extra: &[(String, BoltValue)]) -> Result<Vec<(String, BoltValue)>, BoltError> {
-        // 1. Extract graph name from extra["db"] (default "falkordb")
-        // 2. Convert BoltValue params to FalkorDB params format
-        // 3. Parse query, create plan, execute
-        // 4. Store ResultSummary in connection state for PULL
-        // 5. Return SUCCESS metadata with fields + qid
+    fn run(&self, conn: &mut BoltConnection, msg: &RunMessage<'_>) -> Result<(), BoltError> {
+        // msg.query is &str (zero-copy from buffer)
+        // msg.parameters is PackStreamSlice — parse on demand with msg.parameters.reader()
+        // msg.extra.db is Option<&str> (zero-copy)
+        // 1. Extract graph name from msg.extra.db (default "falkordb")
+        // 2. Parse parameters from PackStreamSlice
+        // 3. Parse query, create plan
+        // 4. Store execution iterator in connection state for PULL
+        // 5. Write SUCCESS metadata with fields + qid directly via conn.write_*
     }
 
-    fn pull(&self, conn: &mut BoltConnection, n: i64, qid: i64) -> Result<(), BoltError> {
-        // Iterate over stored ResultSummary rows
-        // For each row, convert Value → BoltValue, write RECORD
-        // Write final SUCCESS with stats
-    }
+    // PULL is handled internally by the crate — no handler callback.
+    // The crate drains pre-serialized records from the QueryBuffer.
     // ... etc.
 }
 ```
@@ -1992,10 +2124,11 @@ fn reply_bolt_pull(
     while count < limit {
         match active.iterator.next() {
             Some(row) => {
-                let fields: Vec<BoltValue> = active.column_names.iter()
-                    .map(|name| value_to_bolt(&active.runtime, row.get(name).unwrap()))
-                    .collect();
-                conn.write_record(&fields);
+                conn.write_record_header(active.column_names.len() as u32);
+                for name in &active.column_names {
+                    let value = row.get(name).unwrap();
+                    write_runtime_value(conn, &active.runtime, value.clone());
+                }
                 conn.end_message();
                 count += 1;
             }
@@ -2006,10 +2139,12 @@ fn reply_bolt_pull(
     // Check if more rows
     let has_more = active.iterator.size_hint().1 != Some(0); // approximate
     if has_more {
-        conn.write_success(&[("has_more".into(), BoltValue::Boolean(true))]);
+        conn.write_success_header(1);
+        conn.write_string("has_more");
+        conn.write_bool(true);
     } else {
-        // Final SUCCESS with stats
-        conn.write_success(&stats_to_bolt_map(&active.stats));
+        // Final SUCCESS with stats — write directly
+        write_stats(conn, &active.stats);
     }
     conn.end_message();
 }
@@ -2062,7 +2197,7 @@ pub struct QueryBuffer {
     buffer_id: i64,
     records: VecDeque<BytesMut>,                   // Pre-serialized RECORD messages
     execution_complete: bool,                       // True when engine is done (records or error)
-    final_stats: Option<Vec<(String, BoltValue)>>,  // Set on completion
+    final_stats: Option<BytesMut>,                   // Pre-serialized SUCCESS metadata bytes
     error: Option<BoltError>,                       // Error during execution
     expiry_timer: Option<TimerHandle>,              // 10s cleanup timer, started on completion
 }
@@ -2163,37 +2298,19 @@ EmitStats()  → bolt_buffer_complete(client)          // Mark done, store stats
 
 This means `ResultSet_ReplyWithBoltHeader`, `ResultSet_EmitBoltRow`, and `ResultSet_EmitBoltStats` in `resultset_replybolt.c` need only minor changes: replace direct write functions with the new `bolt_reply_*` / `bolt_buffer_*` calls. The C code always uses `BoltClient` — no `buffer_id` exposed. The execution engine and `ResultSet_AddRecord` flow remain unchanged.
 
-#### 4. Add `value_to_bolt()` conversion in `src/bolt.rs`
+#### 4. Add `write_runtime_value()` in `src/bolt.rs`
 
-Convert `graph::runtime::value::Value` → `BoltValue`:
+Writes `graph::runtime::value::Value` directly to the connection buffer — no intermediate types:
 
 ```rust
-fn value_to_bolt(runtime: &Runtime, value: Value) -> BoltValue {
-    match value {
-        Value::Null => BoltValue::Null,
-        Value::Bool(b) => BoltValue::Boolean(b),
-        Value::Int(i) => BoltValue::Integer(i),
-        Value::Float(f) => BoltValue::Float(f),
-        Value::String(s) => BoltValue::String(s.to_string()),
-        Value::List(l) => BoltValue::List(l.iter().map(|v| value_to_bolt(runtime, v.clone())).collect()),
-        Value::Map(m) => BoltValue::Map(m.iter().map(|(k,v)| (k.to_string(), value_to_bolt(runtime, v.clone()))).collect()),
-        Value::Node(id) => {
-            let g = runtime.g.borrow();
-            BoltValue::Node(BoltNode {
-                id: u64::from(id) as i64,
-                labels: g.get_node_label_ids(id).map(|lid| g.get_label_name(lid).to_string()).collect(),
-                properties: g.get_node_attrs(id).iter().map(|key| {
-                    (key.clone(), value_to_bolt(runtime, g.get_node_attribute(id, key).unwrap()))
-                }).collect(),
-                // element_id generated by crate during serialization
-            })
-        }
-        Value::Relationship(rel) => { /* similar */ }
-        Value::Path(p) => { /* convert alternating nodes/rels */ }
-        Value::Point(p) => BoltValue::Point2D(BoltPoint2D { srid: 4326, x: p.longitude, y: p.latitude }),
-        // ... temporal types, VecF32
-    }
-}
+// See the detailed write_runtime_value() implementation in Part 1
+// "Resolution responsibility" section. It writes directly to conn using:
+//   conn.write_node_header(id, label_count, prop_count)
+//   conn.write_string(label)
+//   conn.write_int(value)
+//   conn.write_relationship_header(...)
+//   etc.
+// No intermediate types. Data flows: graph → writer buffer.
 ```
 
 #### 5. Bolt runs on a separate connection path (no command handler changes)
@@ -2268,7 +2385,7 @@ Both projects use the same underlying Redis C API (`RedisModule_EventLoopAdd`). 
 1. `packstream/marker.rs` - All PackStream marker constants
 2. `packstream/serialize.rs` - PackStreamWriter with all type serializers
 3. `packstream/deserialize.rs` - PackStreamReader with all type parsers
-4. `packstream/value.rs` - BoltValue enum and struct definitions
+4. `packstream/types.rs` - PackStream type tags and Bolt struct tag constants
 5. Unit tests: round-trip serialize/deserialize for every type
 
 ### Phase 2: Protocol Layer
@@ -2286,21 +2403,29 @@ Both projects use the same underlying Redis C API (`RedisModule_EventLoopAdd`). 
 5. `server/event_loop.rs` - fd-based integration functions
 6. Integration test: connect with `neo4j-driver` (Python), run HELLO/LOGON
 
-### Phase 4: C FFI
+### Phase 4: Standalone Integration Tests (mock handler + real drivers)
+1. `tests/mock_handler.rs` - MockBoltHandler with canned responses
+2. `tests/common/mod.rs` - Test harness (start mock server on random port)
+3. `tests/integration.rs` - Rust-side integration tests (connection lifecycle, query, values, errors, transactions)
+4. `tests/drivers/python/` - Python driver test suite against mock server
+5. Verify all value types, error recovery, RESET, transactions with real Neo4j Python driver
+6. Test WebSocket transport with Neo4j Browser or JS driver
+
+### Phase 5: C FFI
 1. `ffi/c_api.rs` - All extern "C" functions
 2. `build.rs` - cbindgen header generation
 3. Test: compile and link from a C test program
 4. Match reply API names to existing FalkorDB C bolt API for easy migration
 
-### Phase 5: FalkorDB C Integration
+### Phase 6: FalkorDB C Integration
 1. Create `src/bolt_bridge.c` with callback implementations
 2. Update CMakeLists.txt to link Rust static library
 3. Replace `src/bolt/` calls with new FFI calls in `resultset_replybolt.c`
 4. Update `bolt_api.c` event loop handlers → new bridge
 5. Test: connect Neo4j Browser to FalkorDB via new Rust bolt
 
-### Phase 6: falkordb-rs-next-gen Integration
-1. Add `src/bolt.rs` with `FalkorBoltHandler` + `value_to_bolt()`
+### Phase 7: falkordb-rs-next-gen Integration
+1. Add `src/bolt.rs` with `FalkorBoltHandler` + `write_runtime_value()`
 2. Add `reply_bolt()` to `src/lib.rs`
 3. Register Bolt listener in module init
 4. Add `--bolt` flag handling to command dispatch
@@ -2337,14 +2462,16 @@ impl BoltConnection {
         }
     }
 
-    /// Serialize a value, respecting version-specific struct layouts.
-    fn write_node(&self, writer: &mut PackStreamWriter, node: &BoltNode) {
-        if self.version.minor >= 0 {
-            // 5.0+: 4 fields (id, labels, properties, element_id)
-            writer.write_struct_header(0x4E, 4);
-            // ...
-            writer.write_string(&node.element_id);
-        }
+    /// Streaming node writer, respecting version-specific struct layouts.
+    /// Called internally by conn.write_node_header().
+    fn write_node_header_internal(&self, writer: &mut PackStreamWriter, id: i64,
+                                   label_count: u32, prop_count: u32) {
+        // 5.0+: 4 fields (id, labels, properties, element_id)
+        writer.write_struct_header(0x4E, 4);
+        writer.write_int(id);
+        writer.write_list_header(label_count);
+        // ... caller writes labels + properties ...
+        // element_id generated from id at the end
     }
 }
 ```
@@ -2354,8 +2481,8 @@ impl BoltConnection {
 When Bolt 6.0 ships, the changes are:
 
 1. **Update version negotiation** (`handshake.rs`): Add 6.0 to accepted version ranges
-2. **Add new types** (`value.rs`): Add `BoltValue::Vector(BoltVector)`, `BoltValue::UnsupportedType(...)`
-3. **Add new struct tags** (`marker.rs`): `VECTOR_TAG = 0x56`, `UNSUPPORTED_TYPE_TAG = 0x3F`
+2. **Add new struct tags** (`types.rs`): `VECTOR: u8 = 0x56`, etc.
+3. **Add new streaming writer methods**: `conn.write_vector_header()` etc.
 4. **Version-gate serialization**: `if version.major >= 6 { write_vector(...) }`
 5. **Update BoltHandler trait** (if needed): Add default method implementations for new messages
 
@@ -2396,32 +2523,238 @@ Version negotiation: Accept client proposals for 5.1-5.8 range. Respond with 5.8
 
 ## Part 6: Verification & Testing
 
-### Unit Tests
-- PackStream round-trip for all types (null, bool, int variants, float, string, bytes, list, map, structs)
-- Message parsing for all 13 request types
-- State machine transitions (valid + invalid paths)
-- Chunking encoder/decoder with various message sizes
-- WebSocket frame encode/decode
+### Level 1: Unit Tests (no network, no external dependencies)
 
-### Integration Tests
-- Connect with **Neo4j Python driver** (`neo4j` pip package):
-  ```python
-  from neo4j import GraphDatabase
-  driver = GraphDatabase.driver("bolt://localhost:7687", auth=("falkordb", ""))
-  with driver.session() as session:
-      result = session.run("RETURN 1 AS n")
-      print(result.single()["n"])
-  ```
-- Connect with **Neo4j JavaScript driver**
-- Connect with **Neo4j Browser** (WebSocket transport)
-- Test all value types: nodes, relationships, paths, integers, floats, strings, lists, maps, points
-- Test transactions: BEGIN → RUN → PULL → COMMIT
-- Test error handling: invalid queries → FAILURE response
-- Test RESET after FAILURE
-- Test ROUTE response (for driver routing)
-- Test SHOW DATABASES compatibility (hardcoded response like current C impl)
+Run as `cargo test` in the crate. Test the building blocks in isolation.
 
-### Compatibility
-- Test with FalkorDB's existing test suite after integration
-- Test with falkordb-rs-next-gen's existing test suite after integration
-- Run Neo4j driver conformance tests where applicable
+- **PackStream round-trip**: serialize → deserialize for every type (null, bool, all int widths, float, string, bytes, list, map, struct headers). Verify minimal encoding (e.g., `42` uses TINY_INT not INT64).
+- **Message parsing**: For all 13 request types, construct raw PackStream bytes and parse into the corresponding message struct. Verify borrowed `&str` fields point to the correct buffer range.
+- **Message serialization**: For SUCCESS/FAILURE/IGNORED/RECORD, write to a buffer and verify the bytes match the spec.
+- **State machine transitions**: Test all valid transitions (READY + RUN → STREAMING, etc.) and verify invalid ones return errors. Test `should_ignore()` in FAILED and INTERRUPTED states.
+- **Chunking**: Encode/decode with small messages (single chunk), large messages (multi-chunk), and edge cases (exactly chunk-sized, empty message, max chunk size 65535).
+- **WebSocket frame**: Encode/decode with and without masking. Test fragmented frames.
+- **Version negotiation**: Test handshake parsing with various client version proposals, verify correct version selection.
+
+### Level 2: Standalone Crate Integration Tests (real drivers, mock handler)
+
+**This is the critical standalone validation phase.** The crate is tested as a self-contained Bolt server using a `MockBoltHandler` that returns hardcoded responses. No FalkorDB needed. Real Neo4j drivers connect over TCP/WebSocket.
+
+#### MockBoltHandler
+
+The mock handler lives in `tests/mock_handler.rs` and implements `BoltHandler`:
+
+```rust
+/// A mock handler that serves hardcoded responses.
+/// Used to test the full protocol stack (transport → chunking → handshake →
+/// state machine → message parsing → response serialization) with real drivers.
+struct MockBoltHandler {
+    /// If set, run() returns these column names and canned records.
+    /// This allows testing value serialization without a real graph engine.
+    canned_responses: HashMap<String, CannedQuery>,
+}
+
+struct CannedQuery {
+    columns: Vec<String>,
+    /// Each record is a closure that writes fields directly to the connection.
+    /// This tests the streaming writer API.
+    records: Vec<Box<dyn Fn(&mut BoltConnection)>>,
+}
+
+impl BoltHandler for MockBoltHandler {
+    fn hello(&self, conn: &mut BoltConnection, msg: &HelloMessage<'_>) -> Result<(), BoltError> {
+        // Write SUCCESS with server info
+        conn.write_success_header(3);
+        conn.write_string("server"); conn.write_string("FalkorDB/mock");
+        conn.write_string("connection_id"); conn.write_string("mock-1");
+        conn.write_string("hints"); conn.write_map_header(0);
+        conn.end_message();
+        Ok(())
+    }
+
+    fn authenticate(&self, conn: &mut BoltConnection, msg: &LogonMessage<'_>) -> Result<(), BoltError> {
+        // Accept any credentials
+        conn.write_success_header(0);
+        conn.end_message();
+        Ok(())
+    }
+
+    fn run(&self, conn: &mut BoltConnection, msg: &RunMessage<'_>) -> Result<(), BoltError> {
+        // Look up canned response by query text
+        match self.canned_responses.get(msg.query) {
+            Some(canned) => {
+                // Buffer records
+                for record_fn in &canned.records {
+                    bolt_buffer_record_begin(conn, canned.columns.len() as u32);
+                    record_fn(conn);
+                    bolt_buffer_record_end(conn);
+                }
+                bolt_buffer_complete(conn);
+                // Write RUN SUCCESS (crate adds qid)
+                Ok(())
+            }
+            None => Err(BoltError::new(
+                "Neo.ClientError.Statement.SyntaxError",
+                &format!("Unknown mock query: {}", msg.query),
+            )),
+        }
+    }
+
+    // ... begin/commit/rollback/reset/route with simple hardcoded responses
+}
+```
+
+#### Test suite structure
+
+Tests live in `tests/` directory and run the mock server on a random port:
+
+```rust
+// tests/common/mod.rs
+fn start_mock_server(handler: MockBoltHandler) -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        // Accept connections, run bolt protocol with mock handler
+    });
+    (port, handle)
+}
+```
+
+#### Test categories
+
+**A. Connection lifecycle (handshake, auth, goodbye)**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_handshake_version_negotiation` | Driver connects, negotiates Bolt 5.x. Verify server picks highest mutual version. |
+| `test_hello_success` | HELLO succeeds, driver receives server metadata. |
+| `test_auth_basic` | LOGON with basic auth succeeds. |
+| `test_auth_failure` | LOGON with bad credentials → FAILURE, connection still usable after RESET. |
+| `test_goodbye_clean_disconnect` | GOODBYE closes connection cleanly. |
+
+**B. Query execution (RUN, PULL, DISCARD)**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_return_scalar` | `RETURN 1 AS n` → driver receives integer `1`. Tests basic RUN/PULL cycle. |
+| `test_return_string` | `RETURN 'hello' AS s` → driver receives string. |
+| `test_return_multiple_columns` | `RETURN 1 AS a, 'x' AS b` → driver receives 2 fields per record. |
+| `test_return_multiple_rows` | Canned 100 rows. `PULL {n: 10}` → 10 records + `has_more: true`. Another PULL → remaining. |
+| `test_pull_all` | `PULL {n: -1}` → all records in one batch. |
+| `test_discard` | RUN → DISCARD → no records sent, SUCCESS with stats. |
+| `test_pull_from_different_connection` | RUN on conn A, PULL with matching `qid` on conn B. Verifies QueryBuffer is connection-agnostic. |
+
+**C. Value type serialization**
+
+Each test uses a canned query that returns a specific value type, then verifies the driver deserializes it correctly.
+
+| Test | Canned response | Driver verification |
+|------|----------------|-------------------|
+| `test_value_null` | `RETURN null AS n` | `result["n"] is None` |
+| `test_value_bool` | `RETURN true AS b` | `result["b"] == True` |
+| `test_value_int_tiny` | `RETURN 42 AS n` | `result["n"] == 42` |
+| `test_value_int_large` | `RETURN 9999999999 AS n` | Verify large int round-trip |
+| `test_value_float` | `RETURN 3.14 AS f` | `result["f"] == 3.14` |
+| `test_value_string` | `RETURN 'hello' AS s` | `result["s"] == "hello"` |
+| `test_value_string_unicode` | `RETURN '日本語' AS s` | UTF-8 round-trip |
+| `test_value_list` | `RETURN [1,2,3] AS l` | `result["l"] == [1, 2, 3]` |
+| `test_value_map` | `RETURN {a:1, b:2} AS m` | `result["m"] == {"a": 1, "b": 2}` |
+| `test_value_node` | Canned Node(id=1, labels=["Person"], props={name:"Alice"}) | Driver receives a Node object with correct fields |
+| `test_value_relationship` | Canned Relationship(id=1, start=1, end=2, type="KNOWS", props={}) | Driver receives Relationship with correct start/end |
+| `test_value_path` | Canned Path with 3 nodes, 2 relationships | Driver receives Path, can traverse nodes/rels |
+| `test_value_point2d` | Canned Point2D(srid=4326, x=1.5, y=2.5) | Driver receives spatial Point |
+| `test_value_datetime` | Canned DateTime struct | Driver receives datetime |
+| `test_value_duration` | Canned Duration struct | Driver receives duration |
+| `test_value_nested` | List of Maps containing Nodes | Deep nesting round-trip |
+
+**D. Error handling and recovery**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_syntax_error` | Unknown query → FAILURE with error code. Driver receives ClientException. |
+| `test_failed_state_ignores` | After FAILURE, send RUN → IGNORED. Then RESET → SUCCESS, state recovered. |
+| `test_reset_during_streaming` | RUN → partial PULL → RESET → SUCCESS. Connection is clean for new queries. |
+| `test_reset_with_pipelined_messages` | Driver pipelines RUN + PULL + RESET. First two get IGNORED, RESET succeeds. |
+| `test_buffer_expiry_timer` | RUN → buffer records → wait >10s without PULL → buffer is freed. Next PULL → FAILURE (unknown qid). |
+
+**E. Transactions**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_explicit_transaction` | BEGIN → RUN → PULL → COMMIT. Driver receives results within transaction. |
+| `test_transaction_rollback` | BEGIN → RUN → ROLLBACK. No side effects. |
+| `test_transaction_error` | BEGIN → RUN (error) → FAILURE → RESET → recovered. |
+
+**F. Transport variants**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_tcp_connection` | Standard TCP bolt:// connection works. |
+| `test_websocket_connection` | WebSocket bolt+s:// / ws connection works (HTTP upgrade, framing). |
+| `test_large_message` | Query with >64KB parameter string. Verifies multi-chunk handling. |
+
+**G. Driver compatibility matrix**
+
+Run the same test suite against multiple official Neo4j drivers:
+
+| Driver | Package | Connection URI |
+|--------|---------|---------------|
+| Python | `neo4j` (pip) | `bolt://localhost:{port}` |
+| JavaScript | `neo4j-driver` (npm) | `bolt://localhost:{port}` |
+| Java | `org.neo4j.driver:neo4j-java-driver` (maven) | `bolt://localhost:{port}` |
+| Go | `github.com/neo4j/neo4j-go-driver` | `bolt://localhost:{port}` |
+
+The Python driver is the primary test driver (easiest to script). Other drivers are tested in CI to catch driver-specific protocol behavior.
+
+```python
+# tests/drivers/python/test_mock_server.py
+import pytest
+from neo4j import GraphDatabase
+
+@pytest.fixture
+def driver(mock_server_port):
+    d = GraphDatabase.driver(f"bolt://localhost:{mock_server_port}", auth=("test", "test"))
+    yield d
+    d.close()
+
+def test_return_scalar(driver):
+    with driver.session() as session:
+        result = session.run("RETURN 1 AS n")
+        record = result.single()
+        assert record["n"] == 1
+
+def test_return_node(driver):
+    with driver.session() as session:
+        result = session.run("RETURN_NODE")  # canned query key
+        record = result.single()
+        node = record["n"]
+        assert node.id == 1
+        assert "Person" in node.labels
+        assert node["name"] == "Alice"
+
+def test_error_recovery(driver):
+    with driver.session() as session:
+        with pytest.raises(Exception):
+            session.run("INVALID_QUERY").consume()
+        # Connection should recover — next query works
+        result = session.run("RETURN 1 AS n")
+        assert result.single()["n"] == 1
+```
+
+#### Running standalone tests
+
+```bash
+# Start mock server + run Python driver tests
+cargo test --test integration    # Rust-side mock server tests
+cd tests/drivers/python && pytest  # Driver-side tests (requires neo4j pip package)
+```
+
+### Level 3: FalkorDB Integration Tests (after integration)
+
+After the crate is integrated into FalkorDB C or falkordb-rs-next-gen:
+
+- Run FalkorDB's existing test suite — all existing tests must pass (no regression)
+- Run falkordb-rs-next-gen's existing test suite — same
+- Run the **same driver test suite from Level 2** but against the real FalkorDB server instead of the mock. This verifies that real graph queries produce correct Bolt responses.
+- Neo4j Browser connects and can browse the graph
+- Test with `SHOW DATABASES` / `SHOW DEFAULT DATABASE` compatibility responses
+- Stress test: concurrent connections, large result sets, connection drops
