@@ -2523,17 +2523,70 @@ Version negotiation: Accept client proposals for 5.1-5.8 range. Respond with 5.8
 
 ## Part 6: Verification & Testing
 
+### Lessons from the existing C implementation bugs
+
+[FalkorDB/FalkorDB#1703](https://github.com/FalkorDB/FalkorDB/pull/1703) fixes 18 bugs in the current C Bolt implementation. These bugs directly inform what our Rust crate must get right and what our test suite must cover.
+
+**Bugs our Rust design avoids structurally:**
+
+| C Bug | Rust mitigation |
+|-------|-----------------|
+| `ntohs` instead of `ntohl` for MAP32 size — silently truncates maps | `u32::from_be_bytes()` — type system prevents size confusion |
+| `bolt_reply_int` never emits tiny ints (unsigned `0xF0` = 240 comparison) | Rust's signed `i8` range check. No unsigned/signed confusion |
+| Stack buffer overflow in `is_authenticated` (64-byte fixed buffer) | `read_string()` returns `&str` slice — no buffer to overflow |
+| `write_value` into fixed 4096-byte stack buffer (overflow on large params) | `PackStreamWriter` uses growable `BytesMut` |
+| VLA with attacker-controlled `len` for credentials | No VLAs in Rust. All buffers are heap-allocated and bounds-checked |
+| Unaligned pointer casts `*(int16_t*)(ptr+1)` — UB on strict-alignment | `from_be_bytes()` with safe byte slicing |
+| Point2D writes 4 fields but declares 3 — corrupts framing | `write_point2d()` has hardcoded correct count in one place |
+| Unlimited recursion depth in `write_value` | Streaming writer has no recursion — host writes sequentially |
+
+**Bugs that inform our test suite (must reproduce and verify as regression tests):**
+
+| PR Test | What it catches | Our coverage |
+|---------|----------------|-------------|
+| `test10` tiny int -16..127 | TINY_INT encoding for negative values | Unit: PackStream int encoding range |
+| `test11` negative int boundaries | int8/16/32/64 min values | Unit: all integer width boundaries |
+| `test12-13` Point2D + subsequent values | Struct field count corruption | Unit + Integration: write_point2d framing |
+| `test14,21` large string params (8KB) | Fixed buffer overflow | Integration: large value round-trip |
+| `test15` 100 parameters | Buffer growth under many params | Integration: many-parameter stress |
+| `test16` int16/string16/list16 | 16-bit PackStream markers | Unit: all size header variants |
+| `test17` int32/int64 boundaries | Full integer encoding range | Unit: boundary values |
+| `test18-20` RESET / session cycling | RESET message handling | Integration: connection recovery |
+| `test25-26` consecutive rollbacks | Transaction state machine | Integration: ROLLBACK in TX_STREAMING |
+| `test30` WebSocket handshake | WS transport works | Integration: WebSocket connection |
+| `test31` reject invalid connection | Garbage input handling | Integration: **new — must add** |
+| `test32` Connection header variants | WS header parsing (RFC 7230 OWS) | Integration: **new — must add** |
+
+**Additional design insights from the PR:**
+
+1. **Auth edge case**: Empty credentials ≠ no password. The PR fixes auth to distinguish these cases. Our `BoltAuthCallback` passes credentials to the host (host decides), but we should ensure the crate passes empty strings correctly, not `null`.
+
+2. **WebSocket 64-bit payload length**: The PR adds support for WS payloads >65535. Our `transport/websocket.rs` must handle all three WS length formats (7-bit ≤125, 16-bit ≤65535, 64-bit >65535).
+
+3. **ROLLBACK state transition**: The PR adds missing ROLLBACK handling in TX_STREAMING state (→ READY on success, → FAILED on failure). Our state machine must include this.
+
+4. **Non-blocking socket EAGAIN**: `recv()` returning -1 with `EAGAIN` is not a disconnect — it's "try again later". Our Rust transport handles this via `ErrorKind::WouldBlock`, but we should test it.
+
 ### Level 1: Unit Tests (no network, no external dependencies)
 
 Run as `cargo test` in the crate. Test the building blocks in isolation.
 
-- **PackStream round-trip**: serialize → deserialize for every type (null, bool, all int widths, float, string, bytes, list, map, struct headers). Verify minimal encoding (e.g., `42` uses TINY_INT not INT64).
+- **PackStream integer encoding**: Verify minimal encoding for the full range:
+  - TINY_INT: -16 to 127 (single byte, **must** include negative range — the C bug was here)
+  - INT8: -128 to -17, 128 to 127 (but 128 doesn't fit in i8, so actually only negative range)
+  - INT16: -32768 to -129 and 128 to 32767
+  - INT32: ±2147483647 boundaries
+  - INT64: ±9223372036854775807 boundaries
+  - Round-trip every boundary value: write → read → compare
+- **PackStream other types round-trip**: null, bool, float, string (empty, short, 255-byte, 256-byte, 65536-byte), bytes, list (empty, 15-element, 256-element), map (empty, small, large), struct headers
+- **PackStream size headers**: Verify correct marker selection for 8-bit vs 16-bit vs 32-bit size headers (string8/16/32, list8/16/32, map8/16/32)
 - **Message parsing**: For all 13 request types, construct raw PackStream bytes and parse into the corresponding message struct. Verify borrowed `&str` fields point to the correct buffer range.
 - **Message serialization**: For SUCCESS/FAILURE/IGNORED/RECORD, write to a buffer and verify the bytes match the spec.
-- **State machine transitions**: Test all valid transitions (READY + RUN → STREAMING, etc.) and verify invalid ones return errors. Test `should_ignore()` in FAILED and INTERRUPTED states.
+- **State machine transitions**: Test all valid transitions (READY + RUN → STREAMING, etc.) and verify invalid ones return errors. Test `should_ignore()` in FAILED and INTERRUPTED states. **Include ROLLBACK in TX_STREAMING** (found missing in C code).
 - **Chunking**: Encode/decode with small messages (single chunk), large messages (multi-chunk), and edge cases (exactly chunk-sized, empty message, max chunk size 65535).
-- **WebSocket frame**: Encode/decode with and without masking. Test fragmented frames.
+- **WebSocket frame**: Encode/decode with and without masking. Test all three payload length formats: ≤125 (7-bit), 126-65535 (16-bit), >65535 (64-bit extended). Test fragmented frames.
 - **Version negotiation**: Test handshake parsing with various client version proposals, verify correct version selection.
+- **Struct field counts**: Verify that `write_node_header`, `write_relationship_header`, `write_point2d`, etc. produce the correct struct tag + field count. A wrong count corrupts all subsequent data in the message (as the Point2D bug showed).
 
 ### Level 2: Standalone Crate Integration Tests (real drivers, mock handler)
 
@@ -2629,6 +2682,7 @@ fn start_mock_server(handler: MockBoltHandler) -> (u16, JoinHandle<()>) {
 | `test_hello_success` | HELLO succeeds, driver receives server metadata. |
 | `test_auth_basic` | LOGON with basic auth succeeds. |
 | `test_auth_failure` | LOGON with bad credentials → FAILURE, connection still usable after RESET. |
+| `test_auth_empty_credentials` | LOGON with empty credentials string (not null). Verify crate passes empty string to handler, not null. (PR#1703 auth fix) |
 | `test_goodbye_clean_disconnect` | GOODBYE closes connection cleanly. |
 
 **B. Query execution (RUN, PULL, DISCARD)**
@@ -2684,15 +2738,30 @@ Each test uses a canned query that returns a specific value type, then verifies 
 | `test_transaction_rollback` | BEGIN → RUN → ROLLBACK. No side effects. |
 | `test_transaction_error` | BEGIN → RUN (error) → FAILURE → RESET → recovered. |
 
-**F. Transport variants**
+**F. Stress and boundary tests** (informed by PR#1703 bugs)
 
-| Test | What it verifies |
-|------|-----------------|
-| `test_tcp_connection` | Standard TCP bolt:// connection works. |
-| `test_websocket_connection` | WebSocket bolt+s:// / ws connection works (HTTP upgrade, framing). |
-| `test_large_message` | Query with >64KB parameter string. Verifies multi-chunk handling. |
+| Test | What it verifies | PR#1703 reference |
+|------|-----------------|-------------------|
+| `test_large_string_parameter` | 8KB string parameter round-trip | test14, test21 — fixed stack buffer overflow |
+| `test_many_parameters` | 100 parameters in a single query | test15 — stress buffer growth |
+| `test_large_list_parameter` | 200-element list round-trip | test22 — recursive serialization |
+| `test_nested_map_parameter` | Nested map `{a: {b: {c: 1}}}` round-trip | test23 — recursive map handling |
+| `test_many_large_parameters` | 15 params × 500 bytes each | test24 — combined stress |
+| `test_rapid_session_cycling` | 20 iterations: open session → query → close | test20 — RESET under connection pooling |
+| `test_consecutive_rollbacks` | 5 consecutive BEGIN/ROLLBACK in same session | test25 — ROLLBACK state transitions |
 
-**G. Driver compatibility matrix**
+**G. Transport variants**
+
+| Test | What it verifies | PR#1703 reference |
+|------|-----------------|-------------------|
+| `test_tcp_connection` | Standard TCP bolt:// connection works. | |
+| `test_websocket_connection` | WebSocket bolt+s:// / ws connection works (HTTP upgrade, framing). | test30 |
+| `test_websocket_large_payload` | WS frame with >65535 byte payload (64-bit extended length). | PR fixed missing 64-bit WS length support |
+| `test_websocket_header_variants` | WS upgrade with `Connection: keep-alive, Upgrade` (comma-separated, mixed case, OWS). | test32 — RFC 7230 compliance |
+| `test_invalid_connection_rejected` | Garbage bytes on the TCP port → server closes connection, doesn't crash. | test31 |
+| `test_large_message` | Query with >64KB parameter string. Verifies multi-chunk handling. | |
+
+**H. Driver compatibility matrix**
 
 Run the same test suite against multiple official Neo4j drivers:
 
