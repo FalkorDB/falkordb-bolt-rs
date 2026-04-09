@@ -1,7 +1,7 @@
 pub mod packstream;
 pub mod protocol;
-pub mod transport;
 pub mod server;
+pub mod transport;
 
 #[cfg(feature = "ffi")]
 pub mod ffi;

@@ -1,3 +1,3 @@
 pub mod connection;
-pub mod handler;
 pub mod event_loop;
+pub mod handler;
