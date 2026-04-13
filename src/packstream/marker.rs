@@ -168,6 +168,17 @@ impl Marker {
             Marker::Struct16 => Ok(0xDD),
         }
     }
+
+    /// Encode this marker to its byte representation, panicking on invalid `Tiny*` values.
+    ///
+    /// Use this when the marker is known to be valid (e.g., singleton markers or
+    /// `Tiny*` variants constructed from already-validated values).
+    pub fn byte(self) -> u8 {
+        match self.to_byte() {
+            Ok(b) => b,
+            Err(e) => panic!("invalid marker: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -18,14 +18,14 @@ impl PackStreamWriter {
 
     pub fn write_null(&mut self) {
         self.buf
-            .put_u8(Marker::Null.to_byte().expect("valid marker"));
+            .put_u8(Marker::Null.byte());
     }
 
     pub fn write_bool(&mut self, value: bool) {
         self.buf.put_u8(if value {
-            Marker::True.to_byte().expect("valid marker")
+            Marker::True.byte()
         } else {
-            Marker::False.to_byte().expect("valid marker")
+            Marker::False.byte()
         });
     }
 
@@ -34,33 +34,30 @@ impl PackStreamWriter {
     pub fn write_int(&mut self, value: i64) {
         if (-16..=127).contains(&value) {
             // TINY_INT: the value itself is the marker byte (as i8 cast to u8)
-            self.buf.put_u8(
-                Marker::TinyInt(value as i8)
-                    .to_byte()
-                    .expect("valid marker"),
-            );
+            self.buf
+                .put_u8(Marker::TinyInt(value as i8).byte());
         } else if (i8::MIN as i64..=i8::MAX as i64).contains(&value) {
             self.buf
-                .put_u8(Marker::Int8.to_byte().expect("valid marker"));
+                .put_u8(Marker::Int8.byte());
             self.buf.put_i8(value as i8);
         } else if (i16::MIN as i64..=i16::MAX as i64).contains(&value) {
             self.buf
-                .put_u8(Marker::Int16.to_byte().expect("valid marker"));
+                .put_u8(Marker::Int16.byte());
             self.buf.put_i16(value as i16);
         } else if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
             self.buf
-                .put_u8(Marker::Int32.to_byte().expect("valid marker"));
+                .put_u8(Marker::Int32.byte());
             self.buf.put_i32(value as i32);
         } else {
             self.buf
-                .put_u8(Marker::Int64.to_byte().expect("valid marker"));
+                .put_u8(Marker::Int64.byte());
             self.buf.put_i64(value);
         }
     }
 
     pub fn write_float(&mut self, value: f64) {
         self.buf
-            .put_u8(Marker::Float64.to_byte().expect("valid marker"));
+            .put_u8(Marker::Float64.byte());
         self.buf.put_f64(value);
     }
 
@@ -74,76 +71,77 @@ impl PackStreamWriter {
         let len = b.len();
         if len <= u8::MAX as usize {
             self.buf
-                .put_u8(Marker::Bytes8.to_byte().expect("valid marker"));
+                .put_u8(Marker::Bytes8.byte());
             self.buf.put_u8(len as u8);
         } else if len <= u16::MAX as usize {
             self.buf
-                .put_u8(Marker::Bytes16.to_byte().expect("valid marker"));
+                .put_u8(Marker::Bytes16.byte());
             self.buf.put_u16(len as u16);
         } else {
+            let len = u32::try_from(len)
+                .expect("PackStream bytes length exceeds BYTES32 maximum (4 GiB)");
             self.buf
-                .put_u8(Marker::Bytes32.to_byte().expect("valid marker"));
-            self.buf.put_u32(len as u32);
+                .put_u8(Marker::Bytes32.byte());
+            self.buf.put_u32(len);
         }
         self.buf.extend_from_slice(b);
     }
 
-    pub fn write_list_header(&mut self, size: usize) {
+    pub fn write_list_header(&mut self, size: u32) {
         if size < 16 {
-            self.buf.put_u8(
-                Marker::TinyList(size as u8)
-                    .to_byte()
-                    .expect("valid marker"),
-            );
-        } else if size <= u8::MAX as usize {
             self.buf
-                .put_u8(Marker::List8.to_byte().expect("valid marker"));
+                .put_u8(Marker::TinyList(size as u8).byte());
+        } else if size <= u8::MAX as u32 {
+            self.buf
+                .put_u8(Marker::List8.byte());
             self.buf.put_u8(size as u8);
-        } else if size <= u16::MAX as usize {
+        } else if size <= u16::MAX as u32 {
             self.buf
-                .put_u8(Marker::List16.to_byte().expect("valid marker"));
+                .put_u8(Marker::List16.byte());
             self.buf.put_u16(size as u16);
         } else {
             self.buf
-                .put_u8(Marker::List32.to_byte().expect("valid marker"));
-            self.buf.put_u32(size as u32);
+                .put_u8(Marker::List32.byte());
+            self.buf.put_u32(size);
         }
     }
 
-    pub fn write_map_header(&mut self, size: usize) {
+    pub fn write_map_header(&mut self, size: u32) {
         if size < 16 {
             self.buf
-                .put_u8(Marker::TinyMap(size as u8).to_byte().expect("valid marker"));
-        } else if size <= u8::MAX as usize {
+                .put_u8(Marker::TinyMap(size as u8).byte());
+        } else if size <= u8::MAX as u32 {
             self.buf
-                .put_u8(Marker::Map8.to_byte().expect("valid marker"));
+                .put_u8(Marker::Map8.byte());
             self.buf.put_u8(size as u8);
-        } else if size <= u16::MAX as usize {
+        } else if size <= u16::MAX as u32 {
             self.buf
-                .put_u8(Marker::Map16.to_byte().expect("valid marker"));
+                .put_u8(Marker::Map16.byte());
             self.buf.put_u16(size as u16);
         } else {
             self.buf
-                .put_u8(Marker::Map32.to_byte().expect("valid marker"));
-            self.buf.put_u32(size as u32);
+                .put_u8(Marker::Map32.byte());
+            self.buf.put_u32(size);
         }
     }
 
-    pub fn write_struct_header(&mut self, tag: u8, num_fields: usize) {
+    pub fn write_struct_header(&mut self, tag: u8, num_fields: u32) {
         if num_fields < 16 {
-            self.buf.put_u8(
-                Marker::TinyStruct(num_fields as u8)
-                    .to_byte()
-                    .expect("valid marker"),
-            );
-        } else if num_fields <= u8::MAX as usize {
             self.buf
-                .put_u8(Marker::Struct8.to_byte().expect("valid marker"));
+                .put_u8(Marker::TinyStruct(num_fields as u8).byte());
+        } else if num_fields <= u8::MAX as u32 {
+            self.buf
+                .put_u8(Marker::Struct8.byte());
             self.buf.put_u8(num_fields as u8);
-        } else {
+        } else if num_fields <= u16::MAX as u32 {
             self.buf
-                .put_u8(Marker::Struct16.to_byte().expect("valid marker"));
+                .put_u8(Marker::Struct16.byte());
             self.buf.put_u16(num_fields as u16);
+        } else {
+            panic!(
+                "PackStream struct field count {} exceeds STRUCT16 maximum (65535)",
+                num_fields
+            );
         }
         self.buf.put_u8(tag);
     }
@@ -162,23 +160,22 @@ impl PackStreamWriter {
 
     fn write_string_header(&mut self, len: usize) {
         if len < 16 {
-            self.buf.put_u8(
-                Marker::TinyString(len as u8)
-                    .to_byte()
-                    .expect("valid marker"),
-            );
+            self.buf
+                .put_u8(Marker::TinyString(len as u8).byte());
         } else if len <= u8::MAX as usize {
             self.buf
-                .put_u8(Marker::String8.to_byte().expect("valid marker"));
+                .put_u8(Marker::String8.byte());
             self.buf.put_u8(len as u8);
         } else if len <= u16::MAX as usize {
             self.buf
-                .put_u8(Marker::String16.to_byte().expect("valid marker"));
+                .put_u8(Marker::String16.byte());
             self.buf.put_u16(len as u16);
         } else {
+            let len = u32::try_from(len)
+                .expect("PackStream string length exceeds STRING32 maximum (4 GiB)");
             self.buf
-                .put_u8(Marker::String32.to_byte().expect("valid marker"));
-            self.buf.put_u32(len as u32);
+                .put_u8(Marker::String32.byte());
+            self.buf.put_u32(len);
         }
     }
 }
@@ -417,6 +414,26 @@ mod tests {
         assert_eq!(w.as_bytes(), &expected);
     }
 
+    #[test]
+    fn test_string16_max() {
+        let mut w = PackStreamWriter::new();
+        let s = "a".repeat(65535);
+        w.write_string(&s);
+        let mut expected = vec![0xD1, 0xFF, 0xFF]; // STRING16, len=65535 BE
+        expected.extend_from_slice(s.as_bytes());
+        assert_eq!(w.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn test_string32_boundary() {
+        let mut w = PackStreamWriter::new();
+        let s = "a".repeat(65536);
+        w.write_string(&s);
+        let mut expected = vec![0xD2, 0x00, 0x01, 0x00, 0x00]; // STRING32, len=65536 BE
+        expected.extend_from_slice(s.as_bytes());
+        assert_eq!(w.as_bytes(), &expected);
+    }
+
     // --- Bytes tests ---
 
     #[test]
@@ -434,11 +451,31 @@ mod tests {
     }
 
     #[test]
+    fn test_bytes8_max() {
+        let mut w = PackStreamWriter::new();
+        let b = vec![0x42; 255];
+        w.write_bytes(&b);
+        let mut expected = vec![0xCC, 0xFF]; // BYTES8, len=255
+        expected.extend_from_slice(&b);
+        assert_eq!(w.as_bytes(), &expected);
+    }
+
+    #[test]
     fn test_bytes16_boundary() {
         let mut w = PackStreamWriter::new();
         let b = vec![0x42; 256];
         w.write_bytes(&b);
         let mut expected = vec![0xCD, 0x01, 0x00]; // BYTES16, len=256 BE
+        expected.extend_from_slice(&b);
+        assert_eq!(w.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn test_bytes32_boundary() {
+        let mut w = PackStreamWriter::new();
+        let b = vec![0x42; 65536];
+        w.write_bytes(&b);
+        let mut expected = vec![0xCE, 0x00, 0x01, 0x00, 0x00]; // BYTES32, len=65536 BE
         expected.extend_from_slice(&b);
         assert_eq!(w.as_bytes(), &expected);
     }
@@ -467,10 +504,24 @@ mod tests {
     }
 
     #[test]
+    fn test_list_header_8_max() {
+        let mut w = PackStreamWriter::new();
+        w.write_list_header(255);
+        assert_eq!(w.as_bytes(), &[0xD4, 0xFF]); // LIST8, size=255
+    }
+
+    #[test]
     fn test_list_header_16() {
         let mut w = PackStreamWriter::new();
         w.write_list_header(256);
         assert_eq!(w.as_bytes(), &[0xD5, 0x01, 0x00]); // LIST16, size=256 BE
+    }
+
+    #[test]
+    fn test_list_header_32() {
+        let mut w = PackStreamWriter::new();
+        w.write_list_header(65536);
+        assert_eq!(w.as_bytes(), &[0xD6, 0x00, 0x01, 0x00, 0x00]); // LIST32, size=65536 BE
     }
 
     // --- Map header tests ---
@@ -497,10 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn test_map_header_8_max() {
+        let mut w = PackStreamWriter::new();
+        w.write_map_header(255);
+        assert_eq!(w.as_bytes(), &[0xD8, 0xFF]); // MAP8, size=255
+    }
+
+    #[test]
     fn test_map_header_16() {
         let mut w = PackStreamWriter::new();
         w.write_map_header(256);
         assert_eq!(w.as_bytes(), &[0xD9, 0x01, 0x00]); // MAP16, size=256 BE
+    }
+
+    #[test]
+    fn test_map_header_32() {
+        let mut w = PackStreamWriter::new();
+        w.write_map_header(65536);
+        assert_eq!(w.as_bytes(), &[0xDA, 0x00, 0x01, 0x00, 0x00]); // MAP32, size=65536 BE
     }
 
     // --- Struct header tests ---
@@ -524,6 +589,52 @@ mod tests {
         let mut w = PackStreamWriter::new();
         w.write_struct_header(0x4E, 256);
         assert_eq!(w.as_bytes(), &[0xDD, 0x01, 0x00, 0x4E]); // STRUCT16, 256 BE, tag
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds STRUCT16 maximum")]
+    fn test_struct_header_overflow_panics() {
+        let mut w = PackStreamWriter::new();
+        w.write_struct_header(0x4E, 65536);
+    }
+
+    // --- Composite tests ---
+
+    #[test]
+    fn test_write_simple_map() {
+        let mut w = PackStreamWriter::new();
+        w.write_map_header(1);
+        w.write_string("key");
+        w.write_int(42);
+        assert_eq!(
+            w.as_bytes(),
+            &[
+                0xA1, // TINY_MAP | 1
+                0x83, b'k', b'e', b'y', // TINY_STRING | 3, "key"
+                0x2A, // TINY_INT 42
+            ]
+        );
+    }
+
+    #[test]
+    fn test_write_struct_with_fields() {
+        let mut w = PackStreamWriter::new();
+        // Duration struct: tag=0x45, 4 fields
+        w.write_struct_header(0x45, 4);
+        w.write_int(0); // months
+        w.write_int(0); // days
+        w.write_int(100); // seconds
+        w.write_int(0); // nanoseconds
+        assert_eq!(
+            w.as_bytes(),
+            &[
+                0xB4, 0x45, // TINY_STRUCT | 4, DURATION tag
+                0x00, // TINY_INT 0
+                0x00, // TINY_INT 0
+                0x64, // TINY_INT 100
+                0x00, // TINY_INT 0
+            ]
+        );
     }
 
     // --- Utility tests ---
