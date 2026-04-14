@@ -66,11 +66,15 @@ impl<'a> PackStreamReader<'a> {
     }
 
     fn read_exact(&mut self, n: usize) -> Result<&'a [u8], PackStreamError> {
-        if self.pos + n > self.data.len() {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(PackStreamError::UnexpectedEof)?;
+        if end > self.data.len() {
             return Err(PackStreamError::UnexpectedEof);
         }
-        let slice = &self.data[self.pos..self.pos + n];
-        self.pos += n;
+        let slice = &self.data[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -247,67 +251,75 @@ impl<'a> PackStreamReader<'a> {
         Ok((tag, num_fields))
     }
 
-    /// Skip any value without deserializing it. Handles nested structures recursively.
+    /// Skip any value without deserializing it. Handles nested structures
+    /// iteratively using an explicit stack to avoid stack overflow on deeply
+    /// nested untrusted input.
     pub fn skip_value(&mut self) -> Result<(), PackStreamError> {
-        let marker = self.read_marker()?;
-        match marker {
-            Marker::Null | Marker::True | Marker::False | Marker::TinyInt(_) => Ok(()),
+        // Each entry is the number of remaining values to skip at that nesting level.
+        let mut pending = vec![1u32];
 
-            Marker::Int8 => {
-                self.read_exact(1)?;
-                Ok(())
+        while let Some(remaining) = pending.last_mut() {
+            if *remaining == 0 {
+                pending.pop();
+                continue;
             }
-            Marker::Int16 => {
-                self.read_exact(2)?;
-                Ok(())
-            }
-            Marker::Int32 => {
-                self.read_exact(4)?;
-                Ok(())
-            }
-            Marker::Int64 | Marker::Float64 => {
-                self.read_exact(8)?;
-                Ok(())
-            }
+            *remaining -= 1;
 
-            Marker::TinyString(_) | Marker::String8 | Marker::String16 | Marker::String32 => {
-                let len = self.string_len(marker)?;
-                self.read_exact(len)?;
-                Ok(())
-            }
+            let marker = self.read_marker()?;
+            match marker {
+                Marker::Null | Marker::True | Marker::False | Marker::TinyInt(_) => {}
 
-            Marker::Bytes8 | Marker::Bytes16 | Marker::Bytes32 => {
-                let len = self.bytes_len(marker)?;
-                self.read_exact(len)?;
-                Ok(())
-            }
-
-            Marker::TinyList(_) | Marker::List8 | Marker::List16 | Marker::List32 => {
-                let len = self.list_len(marker)?;
-                for _ in 0..len {
-                    self.skip_value()?;
+                Marker::Int8 => {
+                    self.read_exact(1)?;
                 }
-                Ok(())
-            }
-
-            Marker::TinyMap(_) | Marker::Map8 | Marker::Map16 | Marker::Map32 => {
-                let len = self.map_len(marker)?;
-                for _ in 0..len {
-                    self.skip_value()?; // key
-                    self.skip_value()?; // value
+                Marker::Int16 => {
+                    self.read_exact(2)?;
                 }
-                Ok(())
-            }
-
-            Marker::TinyStruct(_) | Marker::Struct8 | Marker::Struct16 => {
-                let num_fields = self.struct_len(marker)?;
-                self.read_exact(1)?; // tag byte
-                for _ in 0..num_fields {
-                    self.skip_value()?;
+                Marker::Int32 => {
+                    self.read_exact(4)?;
                 }
-                Ok(())
+                Marker::Int64 | Marker::Float64 => {
+                    self.read_exact(8)?;
+                }
+
+                Marker::TinyString(_) | Marker::String8 | Marker::String16 | Marker::String32 => {
+                    let len = self.string_len(marker)?;
+                    self.read_exact(len)?;
+                }
+
+                Marker::Bytes8 | Marker::Bytes16 | Marker::Bytes32 => {
+                    let len = self.bytes_len(marker)?;
+                    self.read_exact(len)?;
+                }
+
+                Marker::TinyList(_) | Marker::List8 | Marker::List16 | Marker::List32 => {
+                    let len = self.list_len(marker)?;
+                    if len > 0 {
+                        pending.push(len);
+                    }
+                }
+
+                Marker::TinyMap(_) | Marker::Map8 | Marker::Map16 | Marker::Map32 => {
+                    let len = self.map_len(marker)?;
+                    if len > 0 {
+                        // Each map entry has a key + value = 2 values per entry.
+                        // Push two frames to avoid overflow-prone `len * 2`.
+                        pending.push(len);
+                        pending.push(len);
+                    }
+                }
+
+                Marker::TinyStruct(_) | Marker::Struct8 | Marker::Struct16 => {
+                    let num_fields = self.struct_len(marker)?;
+                    self.read_exact(1)?; // tag byte
+                    if num_fields > 0 {
+                        pending.push(num_fields);
+                    }
+                }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -536,6 +548,17 @@ mod tests {
     }
 
     #[test]
+    fn read_string32() {
+        let s = "a".repeat(70_000);
+        let len = s.len() as u32;
+        let mut data = vec![Marker::String32.byte()];
+        data.extend_from_slice(&len.to_be_bytes());
+        data.extend_from_slice(s.as_bytes());
+        let mut r = PackStreamReader::new(&data);
+        assert_eq!(r.read_string().unwrap(), s);
+    }
+
+    #[test]
     fn read_string_invalid_utf8() {
         let mut data = vec![0x82]; // TINY_STRING length 2
         data.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
@@ -597,6 +620,17 @@ mod tests {
         assert_eq!(r.read_bytes().unwrap(), &payload[..]);
     }
 
+    #[test]
+    fn read_bytes32() {
+        let payload = vec![0x42; 70_000];
+        let len = payload.len() as u32;
+        let mut data = vec![Marker::Bytes32.byte()];
+        data.extend_from_slice(&len.to_be_bytes());
+        data.extend_from_slice(&payload);
+        let mut r = PackStreamReader::new(&data);
+        assert_eq!(r.read_bytes().unwrap(), &payload[..]);
+    }
+
     // ---- List header ----
 
     #[test]
@@ -643,6 +677,24 @@ mod tests {
         assert_eq!(r.read_map_header().unwrap(), 20);
     }
 
+    #[test]
+    fn read_map16_header() {
+        let len = 300u16;
+        let mut data = vec![Marker::Map16.byte()];
+        data.extend_from_slice(&len.to_be_bytes());
+        let mut r = PackStreamReader::new(&data);
+        assert_eq!(r.read_map_header().unwrap(), 300);
+    }
+
+    #[test]
+    fn read_map32_header() {
+        let len = 70_000u32;
+        let mut data = vec![Marker::Map32.byte()];
+        data.extend_from_slice(&len.to_be_bytes());
+        let mut r = PackStreamReader::new(&data);
+        assert_eq!(r.read_map_header().unwrap(), 70_000);
+    }
+
     // ---- Struct header ----
 
     #[test]
@@ -662,6 +714,18 @@ mod tests {
         let (tag, fields) = r.read_struct_header().unwrap();
         assert_eq!(tag, 0x52);
         assert_eq!(fields, 5);
+    }
+
+    #[test]
+    fn read_struct16_header() {
+        let num_fields = 300u16;
+        let mut data = vec![Marker::Struct16.byte()];
+        data.extend_from_slice(&num_fields.to_be_bytes());
+        data.push(0x4E); // tag = NODE
+        let mut r = PackStreamReader::new(&data);
+        let (tag, fields) = r.read_struct_header().unwrap();
+        assert_eq!(tag, 0x4E);
+        assert_eq!(fields, 300);
     }
 
     // ---- skip_value ----
