@@ -71,7 +71,7 @@ enum DecoderState {
     /// Waiting for the first byte of the 2-byte chunk size header.
     ReadingHeader,
     /// Have the high byte of the header, waiting for the low byte.
-    ReadingHeaderByte2(u8),
+    ReadingHeaderByte2 { first_byte: u8 },
     /// Reading payload bytes; `remaining` bytes still expected.
     ReadingPayload { remaining: u16 },
 }
@@ -134,12 +134,14 @@ impl ChunkDecoder {
                         self.handle_header(size, &mut messages)?;
                     } else {
                         // Only one byte available — stash it.
-                        self.state = DecoderState::ReadingHeaderByte2(data[pos]);
+                        self.state = DecoderState::ReadingHeaderByte2 {
+                            first_byte: data[pos],
+                        };
                         pos += 1;
                     }
                 }
-                DecoderState::ReadingHeaderByte2(hi) => {
-                    let size = u16::from_be_bytes([hi, data[pos]]);
+                DecoderState::ReadingHeaderByte2 { first_byte } => {
+                    let size = u16::from_be_bytes([first_byte, data[pos]]);
                     pos += 1;
                     self.handle_header(size, &mut messages)?;
                 }
