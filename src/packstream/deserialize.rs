@@ -251,24 +251,21 @@ impl<'a> PackStreamReader<'a> {
         Ok((tag, num_fields))
     }
 
-    /// Skip any value without deserializing it. Handles nested structures
-    /// iteratively using an explicit stack to avoid stack overflow on deeply
-    /// nested untrusted input.
+    /// Skip any value without deserializing it. Uses a flat `u64` counter
+    /// instead of recursion — safe against deeply nested untrusted input
+    /// without risking stack overflow or heap allocation.
     pub fn skip_value(&mut self) -> Result<(), PackStreamError> {
-        // Each entry is the number of remaining values to skip at that nesting level.
-        let mut pending = vec![1u32];
+        let mut remaining: u64 = 1;
 
-        while let Some(remaining) = pending.last_mut() {
-            if *remaining == 0 {
-                pending.pop();
-                continue;
-            }
-            *remaining -= 1;
+        while remaining > 0 {
+            remaining -= 1;
 
             let marker = self.read_marker()?;
             match marker {
+                // Zero-byte scalars — marker is the entire value.
                 Marker::Null | Marker::True | Marker::False | Marker::TinyInt(_) => {}
 
+                // Fixed-width scalars — skip the payload bytes.
                 Marker::Int8 => {
                     self.read_exact(1)?;
                 }
@@ -282,39 +279,29 @@ impl<'a> PackStreamReader<'a> {
                     self.read_exact(8)?;
                 }
 
+                // Variable-length byte sequences — read length, skip that many bytes.
                 Marker::TinyString(_) | Marker::String8 | Marker::String16 | Marker::String32 => {
                     let len = self.string_len(marker)?;
                     self.read_exact(len)?;
                 }
-
                 Marker::Bytes8 | Marker::Bytes16 | Marker::Bytes32 => {
                     let len = self.bytes_len(marker)?;
                     self.read_exact(len)?;
                 }
 
+                // Containers — add child count to remaining values.
                 Marker::TinyList(_) | Marker::List8 | Marker::List16 | Marker::List32 => {
-                    let len = self.list_len(marker)?;
-                    if len > 0 {
-                        pending.push(len);
-                    }
+                    remaining += self.list_len(marker)? as u64;
                 }
-
                 Marker::TinyMap(_) | Marker::Map8 | Marker::Map16 | Marker::Map32 => {
-                    let len = self.map_len(marker)?;
-                    if len > 0 {
-                        // Each map entry has a key + value = 2 values per entry.
-                        // Push two frames to avoid overflow-prone `len * 2`.
-                        pending.push(len);
-                        pending.push(len);
-                    }
+                    // Each map entry has a key + value = 2 values per entry.
+                    // u32 * 2 always fits in u64 so no overflow.
+                    remaining += self.map_len(marker)? as u64 * 2;
                 }
-
                 Marker::TinyStruct(_) | Marker::Struct8 | Marker::Struct16 => {
                     let num_fields = self.struct_len(marker)?;
                     self.read_exact(1)?; // tag byte
-                    if num_fields > 0 {
-                        pending.push(num_fields);
-                    }
+                    remaining += num_fields as u64;
                 }
             }
         }
