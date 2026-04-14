@@ -18,8 +18,13 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChunkError {
     /// The accumulated message exceeded the configured maximum size.
+    /// The decoder is now defunct and the connection must be closed.
     #[error("message size {size} exceeds maximum allowed size {max}")]
     MessageTooLarge { size: usize, max: usize },
+    /// The decoder is in a defunct state after a previous fatal error.
+    /// The connection must be closed and a new decoder created.
+    #[error("decoder is defunct after a previous error")]
+    Defunct,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +70,10 @@ pub fn chunk_message(message: &[u8], max_chunk_size: u16) -> BytesMut {
 // Decoder
 // ---------------------------------------------------------------------------
 
+/// Threshold above which the internal buffer is shrunk after emitting a
+/// message, to avoid retaining large allocations across many connections.
+const BUFFER_SHRINK_THRESHOLD: usize = 256 * 1024; // 256 KiB
+
 /// Internal state of the chunk decoder.
 #[derive(Debug, Clone, Copy)]
 enum DecoderState {
@@ -74,6 +83,9 @@ enum DecoderState {
     ReadingHeaderByte2 { first_byte: u8 },
     /// Reading payload bytes; `remaining` bytes still expected.
     ReadingPayload { remaining: u16 },
+    /// A fatal error occurred; the decoder is unusable and the connection
+    /// must be closed.
+    Defunct,
 }
 
 /// Accumulates Bolt chunks from the wire and reassembles complete messages.
@@ -119,8 +131,16 @@ impl ChunkDecoder {
     /// # Errors
     ///
     /// Returns [`ChunkError::MessageTooLarge`] if the accumulated message
-    /// exceeds the configured maximum size.
+    /// exceeds the configured maximum size. The decoder becomes defunct
+    /// after this error — the connection must be closed.
+    ///
+    /// Returns [`ChunkError::Defunct`] if the decoder was already in a
+    /// defunct state from a previous error.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<BytesMut>, ChunkError> {
+        if matches!(self.state, DecoderState::Defunct) {
+            return Err(ChunkError::Defunct);
+        }
+
         let mut messages = Vec::new();
         let mut pos = 0;
 
@@ -158,6 +178,7 @@ impl ChunkDecoder {
                         self.state = DecoderState::ReadingPayload { remaining: left };
                     }
                 }
+                DecoderState::Defunct => return Err(ChunkError::Defunct),
             }
         }
 
@@ -169,19 +190,32 @@ impl ChunkDecoder {
         if size == 0 {
             // Zero-chunk = end of message. Emit the accumulated buffer.
             messages.push(self.buffer.split());
+
+            // If the previous message grew the buffer beyond the shrink
+            // threshold, release the allocation so we don't retain a
+            // high-watermark across many small subsequent messages.
+            if self.buffer.capacity() > BUFFER_SHRINK_THRESHOLD {
+                self.buffer = BytesMut::new();
+            }
+
             self.state = DecoderState::ReadingHeader;
         } else {
             // Check that adding this chunk won't exceed the limit.
             let new_size = self.buffer.len() + size as usize;
             if new_size > self.max_message_size {
-                // Reset state so the decoder is usable after the error.
+                // Transition to Defunct — the remaining payload bytes in the
+                // stream would be misinterpreted as headers if we tried to
+                // continue. The connection must be closed.
                 self.buffer.clear();
-                self.state = DecoderState::ReadingHeader;
+                self.state = DecoderState::Defunct;
                 return Err(ChunkError::MessageTooLarge {
                     size: new_size,
                     max: self.max_message_size,
                 });
             }
+            // Reserve space for the incoming chunk to reduce reallocations
+            // when large payloads arrive across many small feed() calls.
+            self.buffer.reserve(size as usize);
             self.state = DecoderState::ReadingPayload { remaining: size };
         }
         Ok(())
@@ -419,6 +453,17 @@ mod tests {
             result,
             Err(ChunkError::MessageTooLarge { size: 20, max: 10 })
         );
+    }
+
+    #[test]
+    fn decode_defunct_after_too_large() {
+        let mut dec = ChunkDecoder::with_max_message_size(10);
+        // Trigger MessageTooLarge.
+        let result = dec.feed(&[0x00, 20]);
+        assert!(matches!(result, Err(ChunkError::MessageTooLarge { .. })));
+        // Any subsequent feed returns Defunct.
+        let result = dec.feed(&[0x00, 0x01, 0x42, 0x00, 0x00]);
+        assert_eq!(result, Err(ChunkError::Defunct));
     }
 
     // ---- Round-trip tests ----
