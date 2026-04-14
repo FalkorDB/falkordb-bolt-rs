@@ -15,23 +15,12 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during chunk decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChunkError {
     /// The accumulated message exceeded the configured maximum size.
+    #[error("message size {size} exceeds maximum allowed size {max}")]
     MessageTooLarge { size: usize, max: usize },
 }
-
-impl std::fmt::Display for ChunkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ChunkError::MessageTooLarge { size, max } => {
-                write!(f, "message size {size} exceeds maximum allowed size {max}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ChunkError {}
 
 // ---------------------------------------------------------------------------
 // Encoder

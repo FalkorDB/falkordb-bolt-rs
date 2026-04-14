@@ -61,16 +61,9 @@ impl TryFrom<u8> for StructTag {
 }
 
 /// Error returned when a byte does not correspond to a known struct tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown struct tag: 0x{0:02X}")]
 pub struct InvalidStructTag(pub u8);
-
-impl core::fmt::Display for InvalidStructTag {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "unknown struct tag: 0x{:02X}", self.0)
-    }
-}
-
-impl std::error::Error for InvalidStructTag {}
 
 #[cfg(test)]
 mod tests {
