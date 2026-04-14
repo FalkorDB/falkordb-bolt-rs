@@ -17,6 +17,7 @@ sha1 = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false }
 log = "0.4"
+thiserror = "2.0.18"
 
 [build-dependencies]
 cbindgen = "0.28"

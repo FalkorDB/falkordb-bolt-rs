@@ -3,27 +3,18 @@
 use crate::packstream::marker::Marker;
 
 /// Errors that can occur during PackStream deserialization.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PackStreamError {
     /// Not enough bytes remaining in the buffer.
+    #[error("unexpected end of input")]
     UnexpectedEof,
     /// The marker byte does not match the expected type.
+    #[error("invalid marker: 0x{0:02X}")]
     InvalidMarker(u8),
     /// A string value contains invalid UTF-8.
+    #[error("invalid UTF-8 in string")]
     InvalidUtf8,
 }
-
-impl std::fmt::Display for PackStreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PackStreamError::UnexpectedEof => write!(f, "unexpected end of input"),
-            PackStreamError::InvalidMarker(m) => write!(f, "invalid marker: 0x{m:02X}"),
-            PackStreamError::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
-        }
-    }
-}
-
-impl std::error::Error for PackStreamError {}
 
 /// Reads PackStream-encoded data from a byte buffer.
 ///
