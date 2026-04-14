@@ -1,6 +1,6 @@
 // PackStream read (deserialization) — zero-copy reader.
 
-use crate::packstream::marker::{Marker, MarkerError};
+use crate::packstream::marker::Marker;
 
 /// Errors that can occur during PackStream deserialization.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,10 +113,7 @@ impl<'a> PackStreamReader<'a> {
 
     fn read_marker(&mut self) -> Result<Marker, PackStreamError> {
         let b = self.read_u8()?;
-        Marker::from_byte(b).map_err(|e| match e {
-            MarkerError::InvalidByte(b) => PackStreamError::InvalidMarker(b),
-            _ => unreachable!("from_byte only returns InvalidByte"),
-        })
+        Marker::from_byte(b).map_err(|_| PackStreamError::InvalidMarker(b))
     }
 
     // ---- size helpers for containers/strings/bytes ----
@@ -291,17 +288,26 @@ impl<'a> PackStreamReader<'a> {
 
                 // Containers — add child count to remaining values.
                 Marker::TinyList(_) | Marker::List8 | Marker::List16 | Marker::List32 => {
-                    remaining += self.list_len(marker)? as u64;
+                    let len = self.list_len(marker)? as u64;
+                    remaining = remaining
+                        .checked_add(len)
+                        .ok_or(PackStreamError::UnexpectedEof)?;
                 }
                 Marker::TinyMap(_) | Marker::Map8 | Marker::Map16 | Marker::Map32 => {
                     // Each map entry has a key + value = 2 values per entry.
-                    // u32 * 2 always fits in u64 so no overflow.
-                    remaining += self.map_len(marker)? as u64 * 2;
+                    let entries = (self.map_len(marker)? as u64)
+                        .checked_mul(2)
+                        .ok_or(PackStreamError::UnexpectedEof)?;
+                    remaining = remaining
+                        .checked_add(entries)
+                        .ok_or(PackStreamError::UnexpectedEof)?;
                 }
                 Marker::TinyStruct(_) | Marker::Struct8 | Marker::Struct16 => {
-                    let num_fields = self.struct_len(marker)?;
+                    let num_fields = self.struct_len(marker)? as u64;
                     self.read_exact(1)?; // tag byte
-                    remaining += num_fields as u64;
+                    remaining = remaining
+                        .checked_add(num_fields)
+                        .ok_or(PackStreamError::UnexpectedEof)?;
                 }
             }
         }
