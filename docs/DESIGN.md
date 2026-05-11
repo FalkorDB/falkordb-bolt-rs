@@ -496,19 +496,32 @@ pub struct BoltVersion {
 
 #### `protocol/chunking.rs`
 
-```rust
-/// Encodes a complete message into chunks with 16-bit size headers + zero terminator.
-pub fn chunk_message(message: &[u8], max_chunk_size: u16) -> BytesMut;
+Read side only — the de-chunker that reassembles framed wire bytes into
+contiguous message payloads. The encode side is fused into the writer
+(`protocol/messages.rs` / writer layer) so framing happens during PackStream
+serialization with no intermediate buffer copy.
 
+```rust
 /// Accumulates chunks from the wire, returns complete messages.
-pub struct ChunkDecoder {
-    buffer: BytesMut,
-}
+pub struct ChunkDecoder { /* private */ }
 
 impl ChunkDecoder {
     pub fn new() -> Self;
+    pub fn with_max_message_size(max: usize) -> Self;
+
     /// Feed raw bytes. Returns complete de-chunked messages (if any).
-    pub fn feed(&mut self, data: &[u8]) -> Vec<BytesMut>;
+    ///
+    /// Zero-copy fast path: when a complete single-chunk message arrives in
+    /// one `feed` call (the common case for small Bolt messages on a healthy
+    /// link), the returned `Bytes` is a slice of the input — no allocation.
+    /// Multi-chunk and TCP-fragmented messages fall back to an internal
+    /// `BytesMut` accumulator.
+    pub fn feed(&mut self, data: Bytes) -> Result<Vec<Bytes>, ChunkError>;
+}
+
+pub enum ChunkError {
+    MessageTooLarge { size: usize, max: usize },
+    Defunct,
 }
 ```
 
