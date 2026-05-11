@@ -98,22 +98,29 @@ There are 4 data flow paths. Each is analyzed for copies:
 ```
 PATH 1: Client → Server (reading incoming messages)
 ─────────────────────────────────────────────────────
-Wire bytes → de-chunk → contiguous message buffer
-                              │
-                     PackStreamReader borrows from this buffer
-                              │
-                     ┌────────┴────────────┐
-                     │                      │
-              Rust (BoltHandler)      C (FFI callback)
-              Reader returns &str     Raw PackStream bytes
-              borrowed from buffer    passed as (ptr, len)
-              Nothing parsed upfront  C parses with bolt_read_*
-              for scalar fields       directly from buffer
+TCP bytes (Bytes) ─▶ ChunkDecoder ─▶ MessageBuf ─▶ PackStreamReader<MessageBuf>
+                          │              │                  │
+                  accumulates Bytes  Vec<Bytes>: each   Buf-trait cursor
+                  slices of input    segment a slice    walks segments;
+                  (no copies)        of original TCP    primitive reads
+                                     read buffer        cross boundaries
+                                                        transparently
+                                                              │
+                                                ┌─────────────┴────────────┐
+                                                │                          │
+                                         Rust (BoltHandler)          C (FFI callback)
+                                         read_string → PackStreamString  pointer + len
+                                         read_bytes  → Bytes              (FFI translation)
+                                         (refcounted, cheap clone)        materializes on demand
 ```
 
-**Reading (wire → host)**: The `ChunkDecoder` produces a contiguous `BytesMut` message buffer. The `PackStreamReader` borrows from this buffer — `read_string()` returns `&'a str` (zero-copy slice into the buffer). For the Rust API, the `BoltHandler` trait receives borrowed references. For the C API, the raw PackStream bytes are passed as `(ptr, len)` and the host uses `bolt_read_*` functions to parse directly — identical to the existing C pattern.
+**Reading (wire → host)**: The `ChunkDecoder` accumulates references to incoming `Bytes` (TCP read buffers) and emits each message as a [`MessageBuf`](#protocolchunkingrs) — a multi-segment `bytes::Buf` view. **No payload byte is ever copied between buffers**, even for multi-chunk or TCP-fragmented messages. The `PackStreamReader<B: Buf>` walks the segments via the `Buf` trait; variable-length values that fit within a single segment (the typical case) return zero-copy slices, and values that straddle segment boundaries trigger a single small allocation for just that value (`Buf::copy_to_bytes`).
 
-**When copies are unavoidable on read**: If the handler needs to store a value beyond the lifetime of the message buffer (e.g., stash query text for logging), it must explicitly `.to_owned()`. This is the caller's choice, not forced by the crate.
+`read_string()` returns a `PackStreamString` — a refcounted, UTF-8-validated wrapper around `Bytes` that derefs to `&str`. `read_bytes()` returns `Bytes` directly. Both are cheap to clone (Arc refcount bump) and live independently of the source buffer.
+
+**When copies happen on read**: only when a single PackStream value (string/byte array) straddles a chunk or feed boundary. That's one allocation for the straddling value, not for the whole message. For values that fit within a segment — the overwhelming majority of typical Bolt traffic — reads are fully zero-copy.
+
+**When the caller needs to retain a value**: with refcounted `PackStreamString`/`Bytes`, retention is a cheap `.clone()` (Arc bump). No explicit `.to_owned()` is needed.
 
 ```
 PATH 2: Server → Client (writing outgoing messages)
@@ -169,7 +176,7 @@ QueryBuffer.records.pop_front() → pre-serialized BytesMut
 
 There is **no intermediate value enum** in the crate. Both read and write paths use the streaming API directly:
 - **Writing**: Host calls `conn.write_int()`, `conn.write_string()`, `conn.write_node_header()` etc. to encode values directly into the buffer.
-- **Reading**: Host reads with `reader.read_int()`, `reader.read_string()` (borrowed `&str`), `reader.skip_value()` etc. directly from the buffer.
+- **Reading**: Host reads with `reader.read_int()`, `reader.read_string()` (refcounted `PackStreamString`, derefs to `&str`), `reader.read_bytes()` (refcounted `Bytes`), `reader.skip_value()` etc. directly from the buffer.
 
 The host application's own value types (e.g., `Value` in falkordb-rs-next-gen, `SIValue` in FalkorDB C) are serialized/deserialized directly to/from PackStream bytes without any intermediate representation.
 
@@ -244,29 +251,42 @@ impl PackStreamWriter {
 }
 ```
 
-#### `packstream/deserialize.rs` - Reader (zero-copy)
+#### `packstream/deserialize.rs` - Reader (streaming, multi-segment)
 
 ```rust
-/// Reads PackStream-encoded data from a byte buffer.
-/// Returns borrowed references where possible (zero-copy for strings/bytes).
-/// The lifetime 'a ties returned references to the buffer — they are valid
-/// as long as the underlying message buffer is alive.
+use bytes::{Buf, Bytes};
+
+/// UTF-8-valid string backed by a refcounted Bytes. Cheap to clone (Arc bump),
+/// derefs to &str for ergonomic use. Constructed by `read_string` after UTF-8
+/// validation.
+pub struct PackStreamString(Bytes);
+impl PackStreamString {
+    pub fn as_str(&self) -> &str;
+    pub fn into_bytes(self) -> Bytes;
+}
+impl std::ops::Deref for PackStreamString { type Target = str; }
+impl AsRef<str> for PackStreamString { /* ... */ }
+
+/// Reads PackStream-encoded data from any `bytes::Buf` source.
 ///
-/// All multi-byte integer reads use from_be_bytes() on byte slices — never
-/// raw pointer casts (which cause UB on strict-alignment architectures).
-/// Size-reading methods (map/list/string headers) use the correctly-sized
-/// conversion for each marker variant (8/16/32-bit).
-pub struct PackStreamReader<'a> {
-    data: &'a [u8],
-    pos: usize,
+/// Generic over the input buffer type, so it works on a single contiguous
+/// `Bytes` *or* on a multi-segment `MessageBuf` produced by `ChunkDecoder`.
+/// Variable-length values are returned as refcounted `Bytes` / `PackStreamString`:
+/// zero-copy when the value lies in a single segment, one small allocation
+/// when it straddles segments.
+///
+/// All multi-byte integer reads use the `Buf` trait's big-endian getters —
+/// safe across segment boundaries and on strict-alignment architectures.
+pub struct PackStreamReader<B: Buf> {
+    buf: B,
 }
 
-impl<'a> PackStreamReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self;
+impl<B: Buf> PackStreamReader<B> {
+    pub fn new(buf: B) -> Self;
 
-    // --- Zero-copy reads (return references into buffer) ---
-    pub fn read_string(&mut self) -> Result<&'a str, PackStreamError>;
-    pub fn read_bytes(&mut self) -> Result<&'a [u8], PackStreamError>;
+    // --- Refcounted reads (zero-copy within a segment, 1 alloc when straddling) ---
+    pub fn read_string(&mut self) -> Result<PackStreamString, PackStreamError>;
+    pub fn read_bytes(&mut self) -> Result<Bytes, PackStreamError>;
 
     // --- Scalar reads (copy by value, cheap) ---
     pub fn read_null(&mut self) -> Result<(), PackStreamError>;
@@ -282,15 +302,18 @@ impl<'a> PackStreamReader<'a> {
     // --- Skip (advance past a value without reading it) ---
     pub fn skip_value(&mut self) -> Result<(), PackStreamError>;
 
+    pub fn peek(&self) -> Option<u8>;
     pub fn remaining(&self) -> usize;
 }
 ```
 
 **Key design decisions for the reader:**
 
-1. **`read_string()` returns `&'a str`** — zero-copy reference into the message buffer. PackStream strings are length-prefixed, so the reader knows the exact byte range. Since `ChunkDecoder` produces contiguous `BytesMut`, the string is always a valid contiguous slice.
+1. **Generic over `Buf`** — the same reader walks a single contiguous `Bytes` (e.g., for tests, FFI input) or a multi-segment `MessageBuf` from the chunk decoder. No special-cased reader per source.
 
-2. **`skip_value()`** — advances the cursor past a value without allocating anything. Used when the handler doesn't need certain fields (e.g., skipping notification_filter in RUN extras).
+2. **Refcounted variable-length returns** — `PackStreamString` and `Bytes` are Arc-backed. Within a segment they share allocation with the input (zero copy); when straddling, `Buf::copy_to_bytes` allocates exactly the value's bytes (not the whole message). Either way, the returned value lives independently of the reader and is cheap to clone.
+
+3. **`skip_value()`** — iterative flat-counter loop (no recursion → DoS-safe), uses `Buf::advance` to skip payload bytes without allocating.
 
 ---
 
@@ -352,55 +375,61 @@ pub struct RunMessage<'a> {
     pub extra: RunExtra<'a>,
 }
 
-/// PackStream slice — a reference to raw PackStream-encoded data in the buffer.
-/// Avoids parsing nested structures that the handler may not need.
-/// Provides a reader() method for on-demand zero-copy parsing.
-pub struct PackStreamSlice<'a> {
-    data: &'a [u8],
+/// PackStream slice — a reference to raw PackStream-encoded data in the
+/// message buffer. Avoids parsing nested structures that the handler may
+/// not need. Provides a reader() method for on-demand parsing.
+///
+/// Backed by `Bytes` (refcounted, may span multiple original chunks if it
+/// straddles segment boundaries when captured). Cheap to clone.
+pub struct PackStreamSlice {
+    bytes: Bytes,
 }
 
-impl<'a> PackStreamSlice<'a> {
-    /// Create a reader to parse this slice on demand (zero-copy).
-    pub fn reader(&self) -> PackStreamReader<'a>;
+impl PackStreamSlice {
+    /// Create a reader to parse this slice on demand.
+    pub fn reader(&self) -> PackStreamReader<Bytes>;
 
-    /// Get the raw bytes (for C FFI passthrough).
-    pub fn as_bytes(&self) -> &'a [u8];
+    /// Get the raw bytes (for C FFI passthrough or retention).
+    pub fn as_bytes(&self) -> &[u8];
 
     pub fn len(&self) -> usize;
 }
 
 /// Typed extra fields for RUN/BEGIN.
-/// String fields borrow from buffer. Complex fields use PackStreamSlice
-/// so they're only parsed if the handler needs them.
-pub struct RunExtra<'a> {
-    pub db: Option<&'a str>,            // Target database name (most commonly needed)
-    pub mode: Option<&'a str>,          // "r" or "w"
-    pub tx_timeout: Option<i64>,        // Milliseconds
-    pub imp_user: Option<&'a str>,      // Impersonated user
-    pub bookmarks: Option<PackStreamSlice<'a>>,    // Parsed on demand
-    pub tx_metadata: Option<PackStreamSlice<'a>>,  // Parsed on demand
+/// String fields are refcounted (PackStreamString); complex fields use
+/// PackStreamSlice so they're only parsed if the handler needs them.
+pub struct RunExtra {
+    pub db: Option<PackStreamString>,        // Target database name
+    pub mode: Option<PackStreamString>,      // "r" or "w"
+    pub tx_timeout: Option<i64>,             // Milliseconds
+    pub imp_user: Option<PackStreamString>,  // Impersonated user
+    pub bookmarks: Option<PackStreamSlice>,  // Parsed on demand
+    pub tx_metadata: Option<PackStreamSlice>, // Parsed on demand
     // notification_filter skipped (not needed by handler)
 }
 
 pub struct PullMessage { pub n: i64, pub qid: i64 }
 pub struct DiscardMessage { pub n: i64, pub qid: i64 }
-pub struct BeginMessage<'a> { pub extra: RunExtra<'a> }
-pub struct RouteMessage<'a> {
-    pub routing: PackStreamSlice<'a>,
-    pub bookmarks: Option<PackStreamSlice<'a>>,
-    pub db: Option<&'a str>,
+pub struct BeginMessage { pub extra: RunExtra }
+pub struct RouteMessage {
+    pub routing: PackStreamSlice,
+    pub bookmarks: Option<PackStreamSlice>,
+    pub db: Option<PackStreamString>,
 }
 pub struct TelemetryMessage { pub api: i64 }
 
 /// No BoltResponse enum — responses are written directly to the connection's
 /// write buffer via conn.write_success_header(), conn.write_failure(), etc.
 
-/// Parsing: version-aware, zero-copy deserialization.
-/// String fields are borrowed from the message buffer.
+/// Parsing: version-aware, streaming deserialization.
+/// String fields are refcounted PackStreamString (cheap clone, derefs to &str).
 /// Complex nested structures (parameters, bookmarks, metadata) are captured as
-/// PackStreamSlice references — only parsed on demand by the handler.
-impl<'a> BoltRequest<'a> {
-    pub fn parse(reader: &mut PackStreamReader<'a>, version: BoltVersion) -> Result<Self, BoltError> {
+/// PackStreamSlice — only parsed on demand by the handler.
+impl BoltRequest {
+    pub fn parse<B: Buf>(
+        reader: &mut PackStreamReader<B>,
+        version: BoltVersion,
+    ) -> Result<Self, BoltError> {
         let (tag, _size) = reader.read_struct_header()?;
         match tag {
             0x01 => Ok(BoltRequest::Hello(HelloMessage::parse(reader, version)?)),
@@ -417,7 +446,7 @@ impl<'a> BoltRequest<'a> {
 /// conn.write_failure(), conn.write_ignored(). No response enum needed.
 ```
 
-Parsing: `BoltRequest::parse(reader)` reads struct tag and dispatches. String fields are borrowed from the buffer. Nested structures (parameters, extras) are captured as `PackStreamSlice` — raw byte references that can be parsed on demand.
+Parsing: `BoltRequest::parse(reader)` reads struct tag and dispatches. String fields are refcounted (`PackStreamString`). Nested structures (parameters, extras) are captured as `PackStreamSlice` — refcounted byte ranges that can be parsed on demand.
 
 Serialization: Responses are written directly via `conn.write_success()`, `conn.write_failure()`, etc. No intermediate `BoltResponse` enum is constructed during normal operation.
 
@@ -497,33 +526,51 @@ pub struct BoltVersion {
 #### `protocol/chunking.rs`
 
 Read side only — the de-chunker that reassembles framed wire bytes into
-contiguous message payloads. The encode side is fused into the writer
+multi-segment message payloads. The encode side is fused into the writer
 (`protocol/messages.rs` / writer layer) so framing happens during PackStream
 serialization with no intermediate buffer copy.
 
 ```rust
-/// Accumulates chunks from the wire, returns complete messages.
+use bytes::{Buf, Bytes};
+
+/// A complete Bolt message's payload, as one or more refcounted Bytes
+/// segments. Implements `bytes::Buf`, so `PackStreamReader<MessageBuf>`
+/// walks the segments without materializing them into a contiguous buffer.
+/// Every segment is a zero-copy slice of an original TCP read buffer.
+pub struct MessageBuf { /* private: Vec<Bytes> */ }
+
+impl bytes::Buf for MessageBuf {
+    fn remaining(&self) -> usize;
+    fn chunk(&self) -> &[u8];
+    fn advance(&mut self, cnt: usize);
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes; // zero-copy within segment
+}
+
+/// Accumulates chunks from the wire and emits messages.
 pub struct ChunkDecoder { /* private */ }
 
 impl ChunkDecoder {
     pub fn new() -> Self;
     pub fn with_max_message_size(max: usize) -> Self;
 
-    /// Feed raw bytes. Returns complete de-chunked messages (if any).
+    /// Feed raw bytes. Returns complete de-chunked messages.
     ///
-    /// Zero-copy fast path: when a complete single-chunk message arrives in
-    /// one `feed` call (the common case for small Bolt messages on a healthy
-    /// link), the returned `Bytes` is a slice of the input — no allocation.
-    /// Multi-chunk and TCP-fragmented messages fall back to an internal
-    /// `BytesMut` accumulator.
-    pub fn feed(&mut self, data: Bytes) -> Result<Vec<Bytes>, ChunkError>;
+    /// **No payload byte is ever copied** — emitted `MessageBuf`s hold
+    /// refcounted slices of `data` (and possibly of prior feed inputs).
+    /// Single-chunk messages produce a `MessageBuf` with one segment;
+    /// multi-chunk and TCP-fragmented messages produce multiple segments.
+    pub fn feed(&mut self, data: Bytes) -> Result<Vec<MessageBuf>, ChunkError>;
 }
 
 pub enum ChunkError {
-    MessageTooLarge { size: usize, max: usize },
+    MessageTooLarge { size: usize, max: usize }, // → Defunct
     Defunct,
 }
 ```
+
+`MessageTooLarge` transitions the decoder to a `Defunct` state — any
+subsequent `feed` returns `ChunkError::Defunct`. The connection must be
+closed; the byte stream cannot be safely resynced.
 
 ---
 
@@ -1048,6 +1095,15 @@ pub type BoltRollbackCallback = extern "C" fn(conn: BoltClient, user_data: *mut 
 //       const char *str = bolt_read_string_value(&cursor, &len);
 //       // str points into params_buf — zero-copy, valid during callback
 //   }
+//
+// Note: The Rust-side `PackStreamReader` is multi-segment (works on `Buf`),
+// but the C FFI passes a single contiguous `(ptr, len)`. The FFI bridge
+// materializes the message into one contiguous `Bytes` before invoking C
+// callbacks — one allocation at the FFI boundary, only when the message
+// spans multiple segments. In the common case (single-segment message),
+// the C pointer is already a slice of the original TCP read buffer with
+// no copy. The `ffi` feature is gated; this bridge is implemented in
+// Phase 5 (see Implementation Phases).
 #[no_mangle] pub extern "C" fn bolt_read_type(data: *const u8) -> i32;
 #[no_mangle] pub extern "C" fn bolt_read_int_value(data: *mut *const u8) -> i64;
 #[no_mangle] pub extern "C" fn bolt_read_float_value(data: *mut *const u8) -> f64;
@@ -2491,7 +2547,10 @@ pub struct BoltVersion {
 
 impl BoltConnection {
     /// Parse a request message, respecting the negotiated version.
-    fn parse_request(&self, reader: &mut PackStreamReader) -> Result<BoltRequest, BoltError> {
+    fn parse_request<B: Buf>(
+        &self,
+        reader: &mut PackStreamReader<B>,
+    ) -> Result<BoltRequest, BoltError> {
         let (tag, size) = reader.read_struct_header()?;
         match tag {
             0x01 => self.parse_hello(reader, size),

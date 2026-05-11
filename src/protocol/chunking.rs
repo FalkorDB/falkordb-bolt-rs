@@ -8,8 +8,21 @@
 // This module provides only the read-side de-chunker. The encode side will be
 // fused into the writer (issue #10/#11) so framing happens during PackStream
 // serialization with no intermediate buffer copy.
+//
+// # Streaming architecture
+//
+// The decoder accumulates *references* to incoming `Bytes` (not their
+// contents). Each emitted message is a [`MessageBuf`] — a multi-segment
+// `bytes::Buf` view over the payload chunks that comprise the message. No
+// payload byte is ever copied between buffers; segments are reference-counted
+// slices of the original TCP read buffers.
+//
+// `PackStreamReader<MessageBuf>` walks the segments via the `Buf` trait;
+// variable-length values that fit within a single segment are zero-copy
+// slices; values that straddle segment boundaries trigger a single
+// `copy_to_bytes` allocation for just that value (not the whole message).
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 
 /// Default maximum message size the decoder will accept (16 MiB).
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -32,12 +45,122 @@ pub enum ChunkError {
 }
 
 // ---------------------------------------------------------------------------
-// Decoder
+// MessageBuf — multi-segment Buf over a message's payload chunks
 // ---------------------------------------------------------------------------
 
-/// Threshold above which the internal buffer is shrunk after emitting a
-/// message, to avoid retaining large allocations across many connections.
-const BUFFER_SHRINK_THRESHOLD: usize = 256 * 1024; // 256 KiB
+/// A complete Bolt message's payload, represented as one or more
+/// reference-counted [`Bytes`] segments.
+///
+/// Implements [`bytes::Buf`] so the segments can be walked by
+/// `PackStreamReader` without materializing them into a contiguous
+/// allocation. Each segment is a zero-copy slice of an original TCP read
+/// buffer.
+pub struct MessageBuf {
+    /// Payload chunks in order. The first element is the current segment.
+    /// Empty when the buffer is fully consumed.
+    chunks: Vec<Bytes>,
+    /// Total bytes remaining across all chunks. Maintained explicitly so
+    /// `Buf::remaining` is O(1).
+    remaining: usize,
+}
+
+impl MessageBuf {
+    /// Construct from a list of payload segments. Empty segments are
+    /// permitted but skipped on access.
+    pub fn from_chunks(chunks: Vec<Bytes>) -> Self {
+        let remaining = chunks.iter().map(|c| c.len()).sum();
+        let mut buf = Self { chunks, remaining };
+        buf.trim_front_empty();
+        buf
+    }
+
+    /// Number of underlying segments (not bytes). Used by tests to verify
+    /// the decoder produced a single-segment or multi-segment buffer.
+    #[cfg(test)]
+    pub(crate) fn segment_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Borrow the underlying segments. Test-only.
+    #[cfg(test)]
+    pub(crate) fn segments(&self) -> &[Bytes] {
+        &self.chunks
+    }
+
+    /// Drop empty segments from the front so `chunk()` always returns a
+    /// non-empty slice when `remaining() > 0`.
+    fn trim_front_empty(&mut self) {
+        while self.chunks.first().is_some_and(|b| b.is_empty()) {
+            self.chunks.remove(0);
+        }
+    }
+}
+
+impl Buf for MessageBuf {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.chunks.first().map(|b| b.as_ref()).unwrap_or(&[])
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        assert!(
+            cnt <= self.remaining,
+            "advance past end of MessageBuf ({cnt} > {})",
+            self.remaining
+        );
+        self.remaining -= cnt;
+        while cnt > 0 {
+            let first = &mut self.chunks[0];
+            let take = std::cmp::min(first.len(), cnt);
+            first.advance(take);
+            cnt -= take;
+            if first.is_empty() {
+                self.chunks.remove(0);
+            }
+        }
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        assert!(
+            len <= self.remaining,
+            "copy_to_bytes past end ({len} > {})",
+            self.remaining
+        );
+        if self.chunks[0].len() >= len {
+            // Zero-copy: split out from the current segment.
+            let out = self.chunks[0].split_to(len);
+            self.remaining -= len;
+            if self.chunks[0].is_empty() {
+                self.chunks.remove(0);
+            }
+            out
+        } else {
+            // Value straddles segment boundary — one allocation for just
+            // this value, not for the whole message.
+            let mut acc = bytes::BytesMut::with_capacity(len);
+            let mut taken = 0;
+            while taken < len {
+                let first = &mut self.chunks[0];
+                let take = std::cmp::min(first.len(), len - taken);
+                acc.extend_from_slice(&first[..take]);
+                first.advance(take);
+                if first.is_empty() {
+                    self.chunks.remove(0);
+                }
+                taken += take;
+            }
+            self.remaining -= len;
+            acc.freeze()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoder
+// ---------------------------------------------------------------------------
 
 /// Internal state of the chunk decoder.
 #[derive(Debug, Clone, Copy)]
@@ -53,29 +176,18 @@ enum DecoderState {
     Defunct,
 }
 
-/// Accumulates Bolt chunks from the wire and reassembles complete messages.
+/// Accumulates Bolt chunks from the wire and emits complete messages as
+/// multi-segment [`MessageBuf`]s.
 ///
-/// TCP can deliver data at arbitrary byte boundaries, so the decoder
-/// maintains internal state across multiple [`feed`](Self::feed) calls.
-/// Each completed message (delimited by a `0x0000` zero-chunk) is returned
-/// as a contiguous `Bytes` buffer suitable for zero-copy parsing by
-/// `PackStreamReader`.
-///
-/// The contiguous-buffer guarantee is load-bearing: a single PackStream
-/// value can straddle chunk boundaries, so the parser must see one
-/// continuous payload to support `&'a str` / `&'a [u8]` zero-copy reads.
-///
-/// # Zero-copy fast path
-///
-/// When a complete single-chunk message arrives in a single `feed` call —
-/// the common case for small Bolt messages on a healthy TCP link — the
-/// decoder returns a zero-copy `Bytes::slice` of the input. Multi-chunk
-/// messages and TCP-fragmented messages fall back to the accumulating
-/// slow path.
+/// TCP can deliver data at arbitrary byte boundaries; the decoder
+/// maintains state across multiple [`feed`](Self::feed) calls. **No
+/// payload bytes are ever copied** — each emitted segment is a refcounted
+/// slice of an input `Bytes`.
 pub struct ChunkDecoder {
-    /// Accumulation buffer used by the slow path. Empty when the fast path
-    /// is eligible.
-    buffer: BytesMut,
+    /// Payload segments accumulated for the message currently being assembled.
+    pending: Vec<Bytes>,
+    /// Running total of bytes in `pending`, used for `max_message_size` checks.
+    pending_size: usize,
     /// Parser state machine.
     state: DecoderState,
     /// Maximum allowed message size in bytes.
@@ -86,7 +198,8 @@ impl ChunkDecoder {
     /// Create a new decoder with the default max message size (16 MiB).
     pub fn new() -> Self {
         Self {
-            buffer: BytesMut::new(),
+            pending: Vec::new(),
+            pending_size: 0,
             state: DecoderState::ReadingHeader,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
@@ -95,7 +208,8 @@ impl ChunkDecoder {
     /// Create a new decoder with a custom maximum message size.
     pub fn with_max_message_size(max: usize) -> Self {
         Self {
-            buffer: BytesMut::new(),
+            pending: Vec::new(),
+            pending_size: 0,
             state: DecoderState::ReadingHeader,
             max_message_size: max,
         }
@@ -104,7 +218,9 @@ impl ChunkDecoder {
     /// Feed raw bytes from the wire. Returns any complete de-chunked messages.
     ///
     /// A single `feed` call may return zero, one, or multiple messages
-    /// depending on how much data is provided.
+    /// depending on how much data is provided. Returned [`MessageBuf`]s
+    /// hold references into `data` (and possibly into prior feed inputs);
+    /// the underlying allocations stay alive via reference counting.
     ///
     /// # Errors
     ///
@@ -114,7 +230,7 @@ impl ChunkDecoder {
     ///
     /// Returns [`ChunkError::Defunct`] if the decoder was already in a
     /// defunct state from a previous error.
-    pub fn feed(&mut self, mut data: Bytes) -> Result<Vec<Bytes>, ChunkError> {
+    pub fn feed(&mut self, mut data: Bytes) -> Result<Vec<MessageBuf>, ChunkError> {
         if matches!(self.state, DecoderState::Defunct) {
             return Err(ChunkError::Defunct);
         }
@@ -122,36 +238,6 @@ impl ChunkDecoder {
         let mut messages = Vec::new();
 
         while !data.is_empty() {
-            // Fast path: at message boundary, with no accumulated state, and
-            // the start of `data` contains a complete single-chunk message.
-            // Slice the payload directly out of `data` — no copy.
-            if matches!(self.state, DecoderState::ReadingHeader)
-                && self.buffer.is_empty()
-                && data.len() >= 2
-            {
-                let size = u16::from_be_bytes([data[0], data[1]]) as usize;
-                if size == 0 {
-                    // Empty message — just a zero-chunk terminator.
-                    messages.push(Bytes::new());
-                    data.advance(2);
-                    continue;
-                }
-                if size <= self.max_message_size
-                    && data.len() >= 2 + size + 2
-                    && data[2 + size] == 0
-                    && data[2 + size + 1] == 0
-                {
-                    // Single-chunk message fully present: zero-copy slice.
-                    messages.push(data.slice(2..2 + size));
-                    data.advance(2 + size + 2);
-                    continue;
-                }
-                // Otherwise: size > max (slow path will reject), or message
-                // is multi-chunk, or message is fragmented. Fall through.
-            }
-
-            // Slow path: walk the state machine across the available bytes,
-            // accumulating payload into self.buffer.
             match self.state {
                 DecoderState::ReadingHeader => {
                     if data.len() >= 2 {
@@ -159,7 +245,6 @@ impl ChunkDecoder {
                         data.advance(2);
                         self.handle_header(size, &mut messages)?;
                     } else {
-                        // Only one byte — stash it for next feed.
                         self.state = DecoderState::ReadingHeaderByte2 {
                             first_byte: data[0],
                         };
@@ -172,11 +257,13 @@ impl ChunkDecoder {
                     self.handle_header(size, &mut messages)?;
                 }
                 DecoderState::ReadingPayload { remaining } => {
-                    let to_copy = std::cmp::min(remaining as usize, data.len());
-                    self.buffer.extend_from_slice(&data[..to_copy]);
-                    data.advance(to_copy);
+                    let to_take = std::cmp::min(remaining as usize, data.len());
+                    // Zero-copy: split a slice off the front of the input.
+                    let segment = data.split_to(to_take);
+                    self.pending.push(segment);
+                    self.pending_size += to_take;
 
-                    let left = remaining - to_copy as u16;
+                    let left = remaining - to_take as u16;
                     if left == 0 {
                         self.state = DecoderState::ReadingHeader;
                     } else {
@@ -190,37 +277,32 @@ impl ChunkDecoder {
         Ok(messages)
     }
 
-    /// Process a completed chunk header on the slow path.
-    fn handle_header(&mut self, size: u16, messages: &mut Vec<Bytes>) -> Result<(), ChunkError> {
+    /// Process a completed chunk header.
+    fn handle_header(
+        &mut self,
+        size: u16,
+        messages: &mut Vec<MessageBuf>,
+    ) -> Result<(), ChunkError> {
         if size == 0 {
-            // Zero-chunk = end of message. Emit the accumulated buffer.
-            messages.push(self.buffer.split().freeze());
-
-            // If the previous message grew the buffer beyond the shrink
-            // threshold, release the allocation so we don't retain a
-            // high-watermark across many small subsequent messages.
-            if self.buffer.capacity() > BUFFER_SHRINK_THRESHOLD {
-                self.buffer = BytesMut::new();
-            }
-
+            // Zero-chunk = end of message. Emit a MessageBuf over the
+            // accumulated segments.
+            let segments = std::mem::take(&mut self.pending);
+            self.pending_size = 0;
+            messages.push(MessageBuf::from_chunks(segments));
             self.state = DecoderState::ReadingHeader;
         } else {
-            // Check that adding this chunk won't exceed the limit.
-            let new_size = self.buffer.len() + size as usize;
+            let new_size = self.pending_size + size as usize;
             if new_size > self.max_message_size {
-                // Transition to Defunct — the remaining payload bytes in the
-                // stream would be misinterpreted as headers if we tried to
-                // continue. The connection must be closed.
-                self.buffer.clear();
+                // Defunct — the remaining payload bytes would be misinterpreted
+                // as headers if we tried to continue. Connection must be closed.
+                self.pending.clear();
+                self.pending_size = 0;
                 self.state = DecoderState::Defunct;
                 return Err(ChunkError::MessageTooLarge {
                     size: new_size,
                     max: self.max_message_size,
                 });
             }
-            // Reserve space for the incoming chunk to reduce reallocations
-            // when large payloads arrive across many small feed() calls.
-            self.buffer.reserve(size as usize);
             self.state = DecoderState::ReadingPayload { remaining: size };
         }
         Ok(())
@@ -241,34 +323,45 @@ impl Default for ChunkDecoder {
 mod tests {
     use super::*;
 
+    /// Drain a MessageBuf into a Vec<u8> for content assertions.
+    fn collect(mut buf: MessageBuf) -> Vec<u8> {
+        let mut out = Vec::with_capacity(buf.remaining());
+        while buf.has_remaining() {
+            let c = buf.chunk();
+            out.extend_from_slice(c);
+            let n = c.len();
+            buf.advance(n);
+        }
+        out
+    }
+
     /// True iff `slice`'s storage lies within `original`'s allocation range.
-    /// Used to verify fast-path zero-copy slicing.
     fn ptr_within(slice: &Bytes, original_ptr: *const u8, original_len: usize) -> bool {
         let start = slice.as_ptr() as usize;
         let base = original_ptr as usize;
         start >= base && start < base + original_len
     }
 
-    // ---- Basic decoder behavior (covers both fast and slow paths). ----
+    // ---- Basic decoder behavior ----
 
     #[test]
     fn decode_empty_message() {
         let mut dec = ChunkDecoder::new();
         let msgs = dec.feed(Bytes::from_static(&[0x00, 0x00])).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].is_empty());
+        assert_eq!(msgs[0].remaining(), 0);
     }
 
     #[test]
     fn decode_single_chunk() {
         let mut dec = ChunkDecoder::new();
         let payload = [1, 2, 3, 4, 5];
-        let mut data = vec![0x00, 0x05]; // header: 5
+        let mut data = vec![0x00, 0x05];
         data.extend_from_slice(&payload);
-        data.extend_from_slice(&[0x00, 0x00]); // terminator
+        data.extend_from_slice(&[0x00, 0x00]);
         let msgs = dec.feed(Bytes::from(data)).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &payload);
+        assert_eq!(collect(msgs.into_iter().next().unwrap()), payload.to_vec());
     }
 
     #[test]
@@ -277,11 +370,14 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x03, 0xAA, 0xBB, 0xCC]);
         data.extend_from_slice(&[0x00, 0x02, 0xDD, 0xEE]);
-        data.extend_from_slice(&[0x00, 0x00]); // terminator
+        data.extend_from_slice(&[0x00, 0x00]);
 
         let msgs = dec.feed(Bytes::from(data)).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        assert_eq!(
+            collect(msgs.into_iter().next().unwrap()),
+            vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
+        );
     }
 
     #[test]
@@ -294,7 +390,10 @@ mod tests {
         rest.extend_from_slice(&[0x00, 0x00]);
         let msgs = dec.feed(Bytes::from(rest)).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &[0x01, 0x02, 0x03]);
+        assert_eq!(
+            collect(msgs.into_iter().next().unwrap()),
+            vec![0x01, 0x02, 0x03]
+        );
     }
 
     #[test]
@@ -308,7 +407,10 @@ mod tests {
             .feed(Bytes::from_static(&[0x03, 0x04, 0x05, 0x00, 0x00]))
             .unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(
+            collect(msgs.into_iter().next().unwrap()),
+            vec![0x01, 0x02, 0x03, 0x04, 0x05]
+        );
     }
 
     #[test]
@@ -325,7 +427,10 @@ mod tests {
             all_msgs.extend(msgs);
         }
         assert_eq!(all_msgs.len(), 1);
-        assert_eq!(&all_msgs[0][..], &payload);
+        assert_eq!(
+            collect(all_msgs.into_iter().next().unwrap()),
+            payload.to_vec()
+        );
     }
 
     #[test]
@@ -337,8 +442,9 @@ mod tests {
         let mut dec = ChunkDecoder::new();
         let msgs = dec.feed(Bytes::from(data)).unwrap();
         assert_eq!(msgs.len(), 2);
-        assert_eq!(&msgs[0][..], &[0x01, 0x02]);
-        assert_eq!(&msgs[1][..], &[0x03]);
+        let mut it = msgs.into_iter();
+        assert_eq!(collect(it.next().unwrap()), vec![0x01, 0x02]);
+        assert_eq!(collect(it.next().unwrap()), vec![0x03]);
     }
 
     #[test]
@@ -357,10 +463,14 @@ mod tests {
         data.extend_from_slice(&[0x42; 20]);
         data.extend_from_slice(&[0x00, 0x00]);
         let result = dec.feed(Bytes::from(data));
-        assert_eq!(
-            result,
-            Err(ChunkError::MessageTooLarge { size: 20, max: 10 })
-        );
+        match result {
+            Err(ChunkError::MessageTooLarge { size, max }) => {
+                assert_eq!(size, 20);
+                assert_eq!(max, 10);
+            }
+            Err(e) => panic!("expected MessageTooLarge, got error: {e}"),
+            Ok(_) => panic!("expected MessageTooLarge, got Ok"),
+        }
     }
 
     #[test]
@@ -369,15 +479,15 @@ mod tests {
         let result = dec.feed(Bytes::from_static(&[0x00, 0x14]));
         assert!(matches!(result, Err(ChunkError::MessageTooLarge { .. })));
         let result = dec.feed(Bytes::from_static(&[0x00, 0x01, 0x42, 0x00, 0x00]));
-        assert_eq!(result, Err(ChunkError::Defunct));
+        assert!(matches!(result, Err(ChunkError::Defunct)));
     }
 
-    // ---- Fast-path zero-copy verification. ----
+    // ---- Zero-copy verification ----
 
     #[test]
-    fn decode_fast_path_zero_copy() {
-        // A complete single-chunk message in one feed must be returned as a
-        // zero-copy slice of the input — no allocation in the decoder.
+    fn decode_single_chunk_is_zero_copy() {
+        // Single-chunk message in one feed → emitted MessageBuf has one
+        // segment that is a slice of the input allocation.
         let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
         let mut wire = vec![0x00, 0x05];
         wire.extend_from_slice(&payload);
@@ -389,16 +499,71 @@ mod tests {
         let mut dec = ChunkDecoder::new();
         let msgs = dec.feed(input).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &payload);
+        assert_eq!(msgs[0].segment_count(), 1);
         assert!(
-            ptr_within(&msgs[0], input_ptr, input_len),
-            "fast path should return a slice of the input, not a copy"
+            ptr_within(&msgs[0].segments()[0], input_ptr, input_len),
+            "single chunk must share allocation with input"
         );
     }
 
     #[test]
-    fn decode_fast_path_multiple_messages() {
-        // Two single-chunk messages in one feed — both should be zero-copy.
+    fn decode_multi_chunk_is_zero_copy() {
+        // Multi-chunk message → MessageBuf has N segments, EACH a slice of
+        // the input. This is the headline assertion: even multi-chunk
+        // messages no longer trigger a copy.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0x00, 0x03, 0xAA, 0xBB, 0xCC]); // chunk 1
+        wire.extend_from_slice(&[0x00, 0x02, 0xDD, 0xEE]); // chunk 2
+        wire.extend_from_slice(&[0x00, 0x00]); // terminator
+        let input = Bytes::from(wire);
+        let input_ptr = input.as_ptr();
+        let input_len = input.len();
+
+        let mut dec = ChunkDecoder::new();
+        let msgs = dec.feed(input).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].segment_count(), 2);
+        for seg in msgs[0].segments() {
+            assert!(
+                ptr_within(seg, input_ptr, input_len),
+                "every segment must be a slice of the input allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_fragmented_is_zero_copy() {
+        // Payload split across two feeds. Each segment must point into
+        // *its own* feed's allocation — no inter-buffer copying.
+        let feed1 = Bytes::from(vec![0x00, 0x05, 0x01, 0x02]); // header + 2 payload bytes
+        let feed1_ptr = feed1.as_ptr();
+        let feed1_len = feed1.len();
+
+        let feed2 = Bytes::from(vec![0x03, 0x04, 0x05, 0x00, 0x00]); // 3 payload + terminator
+        let feed2_ptr = feed2.as_ptr();
+        let feed2_len = feed2.len();
+
+        let mut dec = ChunkDecoder::new();
+        let msgs = dec.feed(feed1).unwrap();
+        assert!(msgs.is_empty());
+        let msgs = dec.feed(feed2).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let segs = msgs[0].segments();
+        assert_eq!(segs.len(), 2, "one segment per feed contribution");
+        assert!(
+            ptr_within(&segs[0], feed1_ptr, feed1_len),
+            "first segment must be from feed 1"
+        );
+        assert!(
+            ptr_within(&segs[1], feed2_ptr, feed2_len),
+            "second segment must be from feed 2"
+        );
+    }
+
+    #[test]
+    fn decode_multiple_messages_zero_copy() {
+        // Two complete single-chunk messages in one feed — each msg
+        // has one segment that's a slice of the input.
         let mut wire = Vec::new();
         wire.extend_from_slice(&[0x00, 0x02, 0x01, 0x02, 0x00, 0x00]);
         wire.extend_from_slice(&[0x00, 0x03, 0x0A, 0x0B, 0x0C, 0x00, 0x00]);
@@ -409,20 +574,19 @@ mod tests {
         let mut dec = ChunkDecoder::new();
         let msgs = dec.feed(input).unwrap();
         assert_eq!(msgs.len(), 2);
-        assert_eq!(&msgs[0][..], &[0x01, 0x02]);
-        assert_eq!(&msgs[1][..], &[0x0A, 0x0B, 0x0C]);
-        assert!(ptr_within(&msgs[0], input_ptr, input_len));
-        assert!(ptr_within(&msgs[1], input_ptr, input_len));
+        for msg in &msgs {
+            assert_eq!(msg.segment_count(), 1);
+            assert!(ptr_within(&msg.segments()[0], input_ptr, input_len));
+        }
     }
 
     #[test]
-    fn decode_fast_path_falls_back_on_multi_chunk() {
-        // Multi-chunk message must still decode correctly via the slow path.
-        // The output buffer is freshly allocated, not a slice of the input.
+    fn decode_mixed_complete_and_partial() {
+        // First message complete in this feed; second one's first chunk
+        // begins but doesn't terminate.
         let mut wire = Vec::new();
-        wire.extend_from_slice(&[0x00, 0x03, 0xAA, 0xBB, 0xCC]);
-        wire.extend_from_slice(&[0x00, 0x02, 0xDD, 0xEE]);
-        wire.extend_from_slice(&[0x00, 0x00]);
+        wire.extend_from_slice(&[0x00, 0x02, 0x01, 0x02, 0x00, 0x00]); // msg 1
+        wire.extend_from_slice(&[0x00, 0x03, 0x0A, 0x0B, 0x0C]); // msg 2 first chunk, no terminator
         let input = Bytes::from(wire);
         let input_ptr = input.as_ptr();
         let input_len = input.len();
@@ -430,38 +594,79 @@ mod tests {
         let mut dec = ChunkDecoder::new();
         let msgs = dec.feed(input).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
-        assert!(
-            !ptr_within(&msgs[0], input_ptr, input_len),
-            "multi-chunk path must reassemble into a fresh buffer, not slice the input"
-        );
-    }
+        assert!(ptr_within(&msgs[0].segments()[0], input_ptr, input_len));
 
-    #[test]
-    fn decode_mixed_fast_slow() {
-        // First message is single-chunk (fast path). Second starts but
-        // doesn't complete in this feed (multi-chunk straddling feeds).
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&[0x00, 0x02, 0x01, 0x02, 0x00, 0x00]); // msg 1: [0x01, 0x02]
-        wire.extend_from_slice(&[0x00, 0x03, 0x0A, 0x0B, 0x0C]); // msg 2: first chunk, no terminator
-        let input = Bytes::from(wire);
-        let input_ptr = input.as_ptr();
-        let input_len = input.len();
-
-        let mut dec = ChunkDecoder::new();
-        let msgs = dec.feed(input).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &[0x01, 0x02]);
-        assert!(
-            ptr_within(&msgs[0], input_ptr, input_len),
-            "first message should still be zero-copy even with partial follow-up"
-        );
-
-        // Finish message 2.
         let msgs = dec
             .feed(Bytes::from_static(&[0x00, 0x02, 0x0D, 0x0E, 0x00, 0x00]))
             .unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(&msgs[0][..], &[0x0A, 0x0B, 0x0C, 0x0D, 0x0E]);
+        assert_eq!(
+            collect(msgs.into_iter().next().unwrap()),
+            vec![0x0A, 0x0B, 0x0C, 0x0D, 0x0E]
+        );
+    }
+
+    // ---- MessageBuf Buf-trait correctness ----
+
+    #[test]
+    fn messagebuf_buf_impl_single_segment() {
+        let mut buf = MessageBuf::from_chunks(vec![Bytes::from_static(&[1, 2, 3, 4])]);
+        assert_eq!(buf.remaining(), 4);
+        assert_eq!(buf.chunk(), &[1, 2, 3, 4]);
+        assert_eq!(buf.get_u8(), 1);
+        assert_eq!(buf.remaining(), 3);
+        assert_eq!(buf.get_u16(), 0x0203);
+        assert_eq!(buf.remaining(), 1);
+        buf.advance(1);
+        assert_eq!(buf.remaining(), 0);
+    }
+
+    #[test]
+    fn messagebuf_buf_impl_multi_segment_advance() {
+        let mut buf = MessageBuf::from_chunks(vec![
+            Bytes::from_static(&[1, 2]),
+            Bytes::from_static(&[3, 4]),
+            Bytes::from_static(&[5, 6]),
+        ]);
+        assert_eq!(buf.remaining(), 6);
+        buf.advance(3); // crosses segment 1→2
+        assert_eq!(buf.remaining(), 3);
+        assert_eq!(buf.chunk(), &[4]); // mid-segment-2
+        buf.advance(1);
+        assert_eq!(buf.chunk(), &[5, 6]);
+    }
+
+    #[test]
+    fn messagebuf_copy_to_bytes_within_segment_is_zero_copy() {
+        let original = Bytes::from(vec![10, 20, 30, 40, 50]);
+        let ptr = original.as_ptr();
+        let mut buf = MessageBuf::from_chunks(vec![original]);
+        let got = buf.copy_to_bytes(3);
+        assert_eq!(&got[..], &[10, 20, 30]);
+        assert_eq!(got.as_ptr() as usize, ptr as usize);
+    }
+
+    #[test]
+    fn messagebuf_copy_to_bytes_across_segments_allocates() {
+        let mut buf = MessageBuf::from_chunks(vec![
+            Bytes::from_static(&[1, 2]),
+            Bytes::from_static(&[3, 4]),
+        ]);
+        let got = buf.copy_to_bytes(3);
+        assert_eq!(&got[..], &[1, 2, 3]);
+        assert_eq!(buf.remaining(), 1);
+        assert_eq!(buf.chunk(), &[4]);
+    }
+
+    #[test]
+    fn messagebuf_empty_chunks_are_skipped() {
+        let buf = MessageBuf::from_chunks(vec![
+            Bytes::new(),
+            Bytes::from_static(&[1]),
+            Bytes::new(),
+            Bytes::from_static(&[2]),
+        ]);
+        assert_eq!(buf.remaining(), 2);
+        assert_eq!(buf.chunk(), &[1]);
     }
 }

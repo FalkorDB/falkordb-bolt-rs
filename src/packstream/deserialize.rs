@@ -1,4 +1,6 @@
-// PackStream read (deserialization) — zero-copy reader.
+// PackStream read (deserialization) — streaming, multi-segment reader.
+
+use bytes::{Buf, Bytes};
 
 use crate::packstream::marker::Marker;
 
@@ -16,88 +18,139 @@ pub enum PackStreamError {
     InvalidUtf8,
 }
 
-/// Reads PackStream-encoded data from a byte buffer.
+/// A UTF-8-valid string backed by a refcounted [`Bytes`].
 ///
-/// Returns borrowed references where possible (zero-copy for strings/bytes).
-/// The lifetime `'a` ties returned references to the buffer — they are valid
-/// as long as the underlying message buffer is alive.
-///
-/// All multi-byte integer reads use `from_be_bytes()` on byte slices — never
-/// raw pointer casts (which cause UB on strict-alignment architectures).
-pub struct PackStreamReader<'a> {
-    data: &'a [u8],
-    pos: usize,
+/// Cheap to clone (Arc refcount bump). Derefs to `&str` for ergonomic use.
+/// The UTF-8 invariant is enforced when constructed by [`PackStreamReader::read_string`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackStreamString(Bytes);
+
+impl PackStreamString {
+    /// Construct from already-validated UTF-8 bytes.
+    ///
+    /// # Safety
+    /// The caller must guarantee `bytes` is valid UTF-8. Used internally by
+    /// the reader after `std::str::from_utf8` succeeds.
+    pub(crate) unsafe fn from_utf8_unchecked(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    /// View as `&str`. No allocation, no copy.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: invariant enforced at construction by `read_string`.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+
+    /// Consume into the underlying refcounted bytes.
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
 }
 
-impl<'a> PackStreamReader<'a> {
-    /// Create a new reader over the given byte slice.
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+impl std::ops::Deref for PackStreamString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for PackStreamString {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Reads PackStream-encoded data from any [`Buf`] source.
+///
+/// Variable-length values (`read_string`, `read_bytes`) return refcounted
+/// [`Bytes`] / [`PackStreamString`]. When the value fits within the
+/// current segment of the underlying `Buf` (the typical case), the returned
+/// bytes share the source allocation — zero copy. When a value straddles
+/// segment boundaries, one allocation copies the value into a fresh buffer.
+///
+/// All multi-byte integer reads use the `Buf` trait's big-endian getters —
+/// safe across segment boundaries and on strict-alignment architectures.
+pub struct PackStreamReader<B: Buf> {
+    buf: B,
+}
+
+impl<B: Buf> PackStreamReader<B> {
+    /// Create a new reader over any `Buf` source.
+    pub fn new(buf: B) -> Self {
+        Self { buf }
     }
 
     /// Peek at the next byte without consuming it.
     pub fn peek(&self) -> Option<u8> {
-        self.data.get(self.pos).copied()
+        if self.buf.remaining() == 0 {
+            None
+        } else {
+            self.buf.chunk().first().copied()
+        }
     }
 
     /// Number of bytes remaining.
     pub fn remaining(&self) -> usize {
-        self.data.len() - self.pos
+        self.buf.remaining()
     }
 
     // ---- internal helpers ----
 
-    fn read_u8(&mut self) -> Result<u8, PackStreamError> {
-        if self.pos >= self.data.len() {
-            return Err(PackStreamError::UnexpectedEof);
+    fn ensure(&self, n: usize) -> Result<(), PackStreamError> {
+        if self.buf.remaining() < n {
+            Err(PackStreamError::UnexpectedEof)
+        } else {
+            Ok(())
         }
-        let b = self.data[self.pos];
-        self.pos += 1;
-        Ok(b)
     }
 
-    fn read_exact(&mut self, n: usize) -> Result<&'a [u8], PackStreamError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(PackStreamError::UnexpectedEof)?;
-        if end > self.data.len() {
-            return Err(PackStreamError::UnexpectedEof);
-        }
-        let slice = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(slice)
+    fn read_u8(&mut self) -> Result<u8, PackStreamError> {
+        self.ensure(1)?;
+        Ok(self.buf.get_u8())
     }
 
     fn read_i8(&mut self) -> Result<i8, PackStreamError> {
-        Ok(self.read_u8()? as i8)
+        self.ensure(1)?;
+        Ok(self.buf.get_i8())
     }
 
     fn read_i16(&mut self) -> Result<i16, PackStreamError> {
-        let bytes = self.read_exact(2)?;
-        Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
+        self.ensure(2)?;
+        Ok(self.buf.get_i16())
     }
 
     fn read_i32(&mut self) -> Result<i32, PackStreamError> {
-        let bytes = self.read_exact(4)?;
-        Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        self.ensure(4)?;
+        Ok(self.buf.get_i32())
     }
 
     fn read_i64(&mut self) -> Result<i64, PackStreamError> {
-        let bytes = self.read_exact(8)?;
-        Ok(i64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
+        self.ensure(8)?;
+        Ok(self.buf.get_i64())
     }
 
     fn read_u16(&mut self) -> Result<u16, PackStreamError> {
-        let bytes = self.read_exact(2)?;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+        self.ensure(2)?;
+        Ok(self.buf.get_u16())
     }
 
     fn read_u32(&mut self) -> Result<u32, PackStreamError> {
-        let bytes = self.read_exact(4)?;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        self.ensure(4)?;
+        Ok(self.buf.get_u32())
+    }
+
+    /// Read `n` bytes as a refcounted `Bytes`. Zero-copy when the data lies
+    /// within a single underlying segment; allocates only when straddling.
+    fn read_exact_bytes(&mut self, n: usize) -> Result<Bytes, PackStreamError> {
+        self.ensure(n)?;
+        Ok(self.buf.copy_to_bytes(n))
+    }
+
+    /// Advance past `n` bytes without retaining them (for `skip_value`).
+    fn skip_bytes(&mut self, n: usize) -> Result<(), PackStreamError> {
+        self.ensure(n)?;
+        self.buf.advance(n);
+        Ok(())
     }
 
     // ---- marker parsing ----
@@ -198,25 +251,32 @@ impl<'a> PackStreamReader<'a> {
         if marker != Marker::Float64 {
             return Err(PackStreamError::InvalidMarker(marker.byte()));
         }
-        let bytes = self.read_exact(8)?;
-        Ok(f64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
+        self.ensure(8)?;
+        Ok(self.buf.get_f64())
     }
 
-    /// Read a string value — **zero-copy**: returns a slice into the original buffer.
-    pub fn read_string(&mut self) -> Result<&'a str, PackStreamError> {
+    /// Read a string value as a refcounted [`PackStreamString`].
+    ///
+    /// Zero-copy when the value fits within a single segment of the
+    /// underlying `Buf`. Allocates once when the value straddles segments.
+    /// UTF-8 is validated before return.
+    pub fn read_string(&mut self) -> Result<PackStreamString, PackStreamError> {
         let marker = self.read_marker()?;
         let len = self.string_len(marker)?;
-        let bytes = self.read_exact(len)?;
-        std::str::from_utf8(bytes).map_err(|_| PackStreamError::InvalidUtf8)
+        let bytes = self.read_exact_bytes(len)?;
+        std::str::from_utf8(&bytes).map_err(|_| PackStreamError::InvalidUtf8)?;
+        // SAFETY: validated immediately above.
+        Ok(unsafe { PackStreamString::from_utf8_unchecked(bytes) })
     }
 
-    /// Read a byte array — **zero-copy**: returns a slice into the original buffer.
-    pub fn read_bytes(&mut self) -> Result<&'a [u8], PackStreamError> {
+    /// Read a byte array as refcounted [`Bytes`].
+    ///
+    /// Zero-copy when the value fits within a single segment of the
+    /// underlying `Buf`. Allocates once when the value straddles segments.
+    pub fn read_bytes(&mut self) -> Result<Bytes, PackStreamError> {
         let marker = self.read_marker()?;
         let len = self.bytes_len(marker)?;
-        self.read_exact(len)
+        self.read_exact_bytes(len)
     }
 
     /// Read a list header and return the number of elements.
@@ -254,27 +314,19 @@ impl<'a> PackStreamReader<'a> {
                 Marker::Null | Marker::True | Marker::False | Marker::TinyInt(_) => {}
 
                 // Fixed-width scalars — skip the payload bytes.
-                Marker::Int8 => {
-                    self.read_exact(1)?;
-                }
-                Marker::Int16 => {
-                    self.read_exact(2)?;
-                }
-                Marker::Int32 => {
-                    self.read_exact(4)?;
-                }
-                Marker::Int64 | Marker::Float64 => {
-                    self.read_exact(8)?;
-                }
+                Marker::Int8 => self.skip_bytes(1)?,
+                Marker::Int16 => self.skip_bytes(2)?,
+                Marker::Int32 => self.skip_bytes(4)?,
+                Marker::Int64 | Marker::Float64 => self.skip_bytes(8)?,
 
                 // Variable-length byte sequences — read length, skip that many bytes.
                 Marker::TinyString(_) | Marker::String8 | Marker::String16 | Marker::String32 => {
                     let len = self.string_len(marker)?;
-                    self.read_exact(len)?;
+                    self.skip_bytes(len)?;
                 }
                 Marker::Bytes8 | Marker::Bytes16 | Marker::Bytes32 => {
                     let len = self.bytes_len(marker)?;
-                    self.read_exact(len)?;
+                    self.skip_bytes(len)?;
                 }
 
                 // Containers — add child count to remaining values.
@@ -295,7 +347,7 @@ impl<'a> PackStreamReader<'a> {
                 }
                 Marker::TinyStruct(_) | Marker::Struct8 | Marker::Struct16 => {
                     let num_fields = self.struct_len(marker)? as u64;
-                    self.read_exact(1)?; // tag byte
+                    self.skip_bytes(1)?; // tag byte
                     remaining = remaining
                         .checked_add(num_fields)
                         .ok_or(PackStreamError::UnexpectedEof)?;
@@ -312,20 +364,24 @@ mod tests {
     use super::*;
     use crate::packstream::marker::Marker;
 
+    /// Helper: build a reader from a Vec — `Bytes::from(vec)` reuses the
+    /// vec's allocation, so pointer-equality tests are meaningful.
+    fn reader(data: Vec<u8>) -> PackStreamReader<Bytes> {
+        PackStreamReader::new(Bytes::from(data))
+    }
+
     // ---- Null ----
 
     #[test]
     fn read_null() {
-        let data = [Marker::Null.byte()];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Null.byte()]);
         assert!(r.read_null().is_ok());
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn read_null_wrong_marker() {
-        let data = [Marker::True.byte()];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::True.byte()]);
         assert_eq!(
             r.read_null(),
             Err(PackStreamError::InvalidMarker(Marker::True.byte()))
@@ -336,100 +392,81 @@ mod tests {
 
     #[test]
     fn read_bool_true() {
-        let data = [Marker::True.byte()];
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_bool().unwrap(), true);
+        let mut r = reader(vec![Marker::True.byte()]);
+        assert!(r.read_bool().unwrap());
     }
 
     #[test]
     fn read_bool_false() {
-        let data = [Marker::False.byte()];
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_bool().unwrap(), false);
+        let mut r = reader(vec![Marker::False.byte()]);
+        assert!(!r.read_bool().unwrap());
     }
 
     // ---- Integer ----
 
     #[test]
     fn read_tiny_int_zero() {
-        let data = [0x00];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0x00]);
         assert_eq!(r.read_int().unwrap(), 0);
     }
 
     #[test]
     fn read_tiny_int_positive() {
-        let data = [42u8];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![42u8]);
         assert_eq!(r.read_int().unwrap(), 42);
     }
 
     #[test]
     fn read_tiny_int_max() {
-        let data = [127u8];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![127u8]);
         assert_eq!(r.read_int().unwrap(), 127);
     }
 
     #[test]
     fn read_tiny_int_negative() {
-        // -1 as u8 = 0xFF, -16 as u8 = 0xF0
-        let data = [0xFFu8]; // -1
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0xFFu8]); // -1
         assert_eq!(r.read_int().unwrap(), -1);
     }
 
     #[test]
     fn read_tiny_int_min() {
-        let data = [0xF0u8]; // -16
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0xF0u8]); // -16
         assert_eq!(r.read_int().unwrap(), -16);
     }
 
     #[test]
     fn read_int8() {
-        // INT8 marker + value -100 (0x9C)
-        let data = [Marker::Int8.byte(), 0x9C];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int8.byte(), 0x9C]);
         assert_eq!(r.read_int().unwrap(), -100);
     }
 
     #[test]
     fn read_int8_minus_17() {
-        // -17 is the first value below TINY_INT range
-        let data = [Marker::Int8.byte(), (-17i8 as u8)];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int8.byte(), (-17i8 as u8)]);
         assert_eq!(r.read_int().unwrap(), -17);
     }
 
     #[test]
     fn read_int8_minus_128() {
-        let data = [Marker::Int8.byte(), 0x80]; // -128 as i8
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int8.byte(), 0x80]);
         assert_eq!(r.read_int().unwrap(), -128);
     }
 
     #[test]
     fn read_int16() {
-        // 1000 = 0x03E8
-        let data = [Marker::Int16.byte(), 0x03, 0xE8];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int16.byte(), 0x03, 0xE8]);
         assert_eq!(r.read_int().unwrap(), 1000);
     }
 
     #[test]
     fn read_int16_negative() {
-        // -1000 as i16 = 0xFC18
-        let data = [Marker::Int16.byte(), 0xFC, 0x18];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int16.byte(), 0xFC, 0x18]);
         assert_eq!(r.read_int().unwrap(), -1000);
     }
 
     #[test]
     fn read_int32() {
-        // 100_000 = 0x000186A0
-        let data = [Marker::Int32.byte(), 0x00, 0x01, 0x86, 0xA0];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int32.byte(), 0x00, 0x01, 0x86, 0xA0]);
         assert_eq!(r.read_int().unwrap(), 100_000);
     }
 
@@ -437,28 +474,31 @@ mod tests {
     fn read_int32_negative() {
         let val: i32 = -100_000;
         let bytes = val.to_be_bytes();
-        let data = [Marker::Int32.byte(), bytes[0], bytes[1], bytes[2], bytes[3]];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![
+            Marker::Int32.byte(),
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+        ]);
         assert_eq!(r.read_int().unwrap(), -100_000);
     }
 
     #[test]
     fn read_int64() {
         let val: i64 = 1_000_000_000_000;
-        let bytes = val.to_be_bytes();
         let mut data = vec![Marker::Int64.byte()];
-        data.extend_from_slice(&bytes);
-        let mut r = PackStreamReader::new(&data);
+        data.extend_from_slice(&val.to_be_bytes());
+        let mut r = reader(data);
         assert_eq!(r.read_int().unwrap(), 1_000_000_000_000);
     }
 
     #[test]
     fn read_int64_min() {
         let val: i64 = i64::MIN;
-        let bytes = val.to_be_bytes();
         let mut data = vec![Marker::Int64.byte()];
-        data.extend_from_slice(&bytes);
-        let mut r = PackStreamReader::new(&data);
+        data.extend_from_slice(&val.to_be_bytes());
+        let mut r = reader(data);
         assert_eq!(r.read_int().unwrap(), i64::MIN);
     }
 
@@ -467,29 +507,25 @@ mod tests {
     #[test]
     fn read_float() {
         let val: f64 = 3.14;
-        let bytes = val.to_be_bytes();
         let mut data = vec![Marker::Float64.byte()];
-        data.extend_from_slice(&bytes);
-        let mut r = PackStreamReader::new(&data);
+        data.extend_from_slice(&val.to_be_bytes());
+        let mut r = reader(data);
         assert!((r.read_float().unwrap() - 3.14).abs() < f64::EPSILON);
     }
 
     #[test]
     fn read_float_zero() {
-        let bytes = 0.0f64.to_be_bytes();
         let mut data = vec![Marker::Float64.byte()];
-        data.extend_from_slice(&bytes);
-        let mut r = PackStreamReader::new(&data);
+        data.extend_from_slice(&0.0f64.to_be_bytes());
+        let mut r = reader(data);
         assert_eq!(r.read_float().unwrap(), 0.0);
     }
 
     #[test]
     fn read_float_negative() {
-        let val: f64 = -1.5;
-        let bytes = val.to_be_bytes();
         let mut data = vec![Marker::Float64.byte()];
-        data.extend_from_slice(&bytes);
-        let mut r = PackStreamReader::new(&data);
+        data.extend_from_slice(&(-1.5f64).to_be_bytes());
+        let mut r = reader(data);
         assert_eq!(r.read_float().unwrap(), -1.5);
     }
 
@@ -497,18 +533,16 @@ mod tests {
 
     #[test]
     fn read_tiny_string_empty() {
-        let data = [0x80]; // TINY_STRING with length 0
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_string().unwrap(), "");
+        let mut r = reader(vec![0x80]);
+        assert_eq!(r.read_string().unwrap().as_str(), "");
     }
 
     #[test]
     fn read_tiny_string() {
-        // TINY_STRING with length 5 + "hello"
         let mut data = vec![0x85];
         data.extend_from_slice(b"hello");
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_string().unwrap(), "hello");
+        let mut r = reader(data);
+        assert_eq!(r.read_string().unwrap().as_str(), "hello");
     }
 
     #[test]
@@ -516,8 +550,8 @@ mod tests {
         let s = "a]".repeat(20); // 40 bytes > 15
         let mut data = vec![Marker::String8.byte(), 40];
         data.extend_from_slice(s.as_bytes());
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_string().unwrap(), s);
+        let mut r = reader(data);
+        assert_eq!(r.read_string().unwrap().as_str(), s);
     }
 
     #[test]
@@ -527,8 +561,8 @@ mod tests {
         let mut data = vec![Marker::String16.byte()];
         data.extend_from_slice(&len.to_be_bytes());
         data.extend_from_slice(s.as_bytes());
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_string().unwrap(), s);
+        let mut r = reader(data);
+        assert_eq!(r.read_string().unwrap().as_str(), s);
     }
 
     #[test]
@@ -538,32 +572,38 @@ mod tests {
         let mut data = vec![Marker::String32.byte()];
         data.extend_from_slice(&len.to_be_bytes());
         data.extend_from_slice(s.as_bytes());
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_string().unwrap(), s);
+        let mut r = reader(data);
+        assert_eq!(r.read_string().unwrap().as_str(), s);
     }
 
     #[test]
     fn read_string_invalid_utf8() {
         let mut data = vec![0x82]; // TINY_STRING length 2
         data.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         assert_eq!(r.read_string(), Err(PackStreamError::InvalidUtf8));
     }
 
     #[test]
-    fn read_string_zero_copy() {
+    fn read_string_zero_copy_within_segment() {
+        // String fits in one segment of the input Bytes — returned
+        // PackStreamString must share that allocation (zero copy).
         let mut data = vec![0x85]; // TINY_STRING length 5
         data.extend_from_slice(b"hello");
-        let r_data = &data[..];
-        let mut reader = PackStreamReader::new(r_data);
-        let s = reader.read_string().unwrap();
-        // The returned string slice should point directly into the input buffer.
-        let s_ptr = s.as_ptr();
-        let buf_ptr = r_data[1..].as_ptr(); // skip marker byte
-        assert_eq!(
-            s_ptr, buf_ptr,
-            "zero-copy: string should point into original buffer"
+        let input = Bytes::from(data);
+        let input_ptr = input.as_ptr();
+        let input_len = input.len();
+
+        let mut r = PackStreamReader::new(input);
+        let s = r.read_string().unwrap();
+        let s_ptr = s.as_str().as_ptr();
+        let base = input_ptr as usize;
+        let off = s_ptr as usize - base;
+        assert!(
+            off < input_len,
+            "zero-copy: returned string must point into the input allocation"
         );
+        assert_eq!(off, 1, "string payload starts after the 1-byte marker");
     }
 
     // ---- Bytes ----
@@ -573,24 +613,27 @@ mod tests {
         let payload = [0x01, 0x02, 0x03, 0x04];
         let mut data = vec![Marker::Bytes8.byte(), 4];
         data.extend_from_slice(&payload);
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_bytes().unwrap(), &payload);
+        let mut r = reader(data);
+        assert_eq!(&r.read_bytes().unwrap()[..], &payload);
     }
 
     #[test]
-    fn read_bytes_zero_copy() {
+    fn read_bytes_zero_copy_within_segment() {
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
         let mut data = vec![Marker::Bytes8.byte(), 4];
         data.extend_from_slice(&payload);
-        let r_data = &data[..];
-        let mut reader = PackStreamReader::new(r_data);
-        let b = reader.read_bytes().unwrap();
-        let b_ptr = b.as_ptr();
-        let buf_ptr = r_data[2..].as_ptr(); // skip marker + length byte
-        assert_eq!(
-            b_ptr, buf_ptr,
-            "zero-copy: bytes should point into original buffer"
+        let input = Bytes::from(data);
+        let input_ptr = input.as_ptr();
+        let input_len = input.len();
+
+        let mut r = PackStreamReader::new(input);
+        let b = r.read_bytes().unwrap();
+        let off = b.as_ptr() as usize - input_ptr as usize;
+        assert!(
+            off < input_len,
+            "zero-copy: bytes must point into the input allocation"
         );
+        assert_eq!(off, 2, "bytes payload starts after marker + length byte");
     }
 
     #[test]
@@ -600,8 +643,8 @@ mod tests {
         let mut data = vec![Marker::Bytes16.byte()];
         data.extend_from_slice(&len.to_be_bytes());
         data.extend_from_slice(&payload);
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_bytes().unwrap(), &payload[..]);
+        let mut r = reader(data);
+        assert_eq!(&r.read_bytes().unwrap()[..], &payload[..]);
     }
 
     #[test]
@@ -611,37 +654,33 @@ mod tests {
         let mut data = vec![Marker::Bytes32.byte()];
         data.extend_from_slice(&len.to_be_bytes());
         data.extend_from_slice(&payload);
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_bytes().unwrap(), &payload[..]);
+        let mut r = reader(data);
+        assert_eq!(&r.read_bytes().unwrap()[..], &payload[..]);
     }
 
     // ---- List header ----
 
     #[test]
     fn read_tiny_list_header() {
-        let data = [0x93]; // TINY_LIST with 3 elements
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0x93]); // TINY_LIST with 3 elements
         assert_eq!(r.read_list_header().unwrap(), 3);
     }
 
     #[test]
     fn read_list8_header() {
-        let data = [Marker::List8.byte(), 20];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::List8.byte(), 20]);
         assert_eq!(r.read_list_header().unwrap(), 20);
     }
 
     #[test]
     fn read_list16_header() {
-        let data = [Marker::List16.byte(), 0x01, 0x00]; // 256
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::List16.byte(), 0x01, 0x00]); // 256
         assert_eq!(r.read_list_header().unwrap(), 256);
     }
 
     #[test]
     fn read_list32_header() {
-        let data = [Marker::List32.byte(), 0x00, 0x01, 0x00, 0x00]; // 65536
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::List32.byte(), 0x00, 0x01, 0x00, 0x00]); // 65536
         assert_eq!(r.read_list_header().unwrap(), 65536);
     }
 
@@ -649,15 +688,13 @@ mod tests {
 
     #[test]
     fn read_tiny_map_header() {
-        let data = [0xA2]; // TINY_MAP with 2 entries
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0xA2]); // TINY_MAP with 2 entries
         assert_eq!(r.read_map_header().unwrap(), 2);
     }
 
     #[test]
     fn read_map8_header() {
-        let data = [Marker::Map8.byte(), 20];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Map8.byte(), 20]);
         assert_eq!(r.read_map_header().unwrap(), 20);
     }
 
@@ -666,7 +703,7 @@ mod tests {
         let len = 300u16;
         let mut data = vec![Marker::Map16.byte()];
         data.extend_from_slice(&len.to_be_bytes());
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         assert_eq!(r.read_map_header().unwrap(), 300);
     }
 
@@ -675,7 +712,7 @@ mod tests {
         let len = 70_000u32;
         let mut data = vec![Marker::Map32.byte()];
         data.extend_from_slice(&len.to_be_bytes());
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         assert_eq!(r.read_map_header().unwrap(), 70_000);
     }
 
@@ -683,9 +720,7 @@ mod tests {
 
     #[test]
     fn read_tiny_struct_header() {
-        // TINY_STRUCT with 3 fields, tag = 0x4E (NODE)
-        let data = [0xB3, 0x4E];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0xB3, 0x4E]); // TINY_STRUCT with 3 fields, tag NODE
         let (tag, fields) = r.read_struct_header().unwrap();
         assert_eq!(tag, 0x4E);
         assert_eq!(fields, 3);
@@ -693,8 +728,7 @@ mod tests {
 
     #[test]
     fn read_struct8_header() {
-        let data = [Marker::Struct8.byte(), 5, 0x52]; // 5 fields, tag = RELATIONSHIP
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Struct8.byte(), 5, 0x52]); // 5 fields, tag RELATIONSHIP
         let (tag, fields) = r.read_struct_header().unwrap();
         assert_eq!(tag, 0x52);
         assert_eq!(fields, 5);
@@ -706,7 +740,7 @@ mod tests {
         let mut data = vec![Marker::Struct16.byte()];
         data.extend_from_slice(&num_fields.to_be_bytes());
         data.push(0x4E); // tag = NODE
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         let (tag, fields) = r.read_struct_header().unwrap();
         assert_eq!(tag, 0x4E);
         assert_eq!(fields, 300);
@@ -716,48 +750,42 @@ mod tests {
 
     #[test]
     fn skip_null() {
-        let data = [Marker::Null.byte()];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Null.byte()]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_bool() {
-        let data = [Marker::True.byte()];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::True.byte()]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_tiny_int() {
-        let data = [42u8];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![42u8]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_int8() {
-        let data = [Marker::Int8.byte(), 0x9C];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int8.byte(), 0x9C]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_int16() {
-        let data = [Marker::Int16.byte(), 0x03, 0xE8];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int16.byte(), 0x03, 0xE8]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_int32() {
-        let data = [Marker::Int32.byte(), 0x00, 0x01, 0x86, 0xA0];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int32.byte(), 0x00, 0x01, 0x86, 0xA0]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
@@ -766,7 +794,7 @@ mod tests {
     fn skip_int64() {
         let mut data = vec![Marker::Int64.byte()];
         data.extend_from_slice(&42i64.to_be_bytes());
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
@@ -775,66 +803,61 @@ mod tests {
     fn skip_float() {
         let mut data = vec![Marker::Float64.byte()];
         data.extend_from_slice(&3.14f64.to_be_bytes());
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_string() {
-        let mut data = vec![0x85]; // TINY_STRING length 5
+        let mut data = vec![0x85];
         data.extend_from_slice(b"hello");
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_bytes() {
-        let data = vec![Marker::Bytes8.byte(), 3, 0x01, 0x02, 0x03];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Bytes8.byte(), 3, 0x01, 0x02, 0x03]);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_list() {
-        // List of 2 elements: [42, "hi"]
         let mut data = vec![0x92]; // TINY_LIST 2
         data.push(42u8); // tiny int 42
         data.push(0x82); // TINY_STRING length 2
         data.extend_from_slice(b"hi");
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_map() {
-        // Map with 1 entry: {"a": 1}
         let mut data = vec![0xA1]; // TINY_MAP 1
         data.push(0x81); // TINY_STRING length 1 (key)
         data.push(b'a');
         data.push(1u8); // tiny int 1 (value)
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_struct() {
-        // Struct with 2 fields, tag 0x4E
         let mut data = vec![0xB2, 0x4E]; // TINY_STRUCT 2 fields, tag NODE
-        data.push(42u8); // field 1: tiny int
-        data.push(Marker::Null.byte()); // field 2: null
-        let mut r = PackStreamReader::new(&data);
+        data.push(42u8);
+        data.push(Marker::Null.byte());
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
 
     #[test]
     fn skip_nested_list_in_map() {
-        // Map {key: [1, 2, 3]}
         let mut data = vec![0xA1]; // TINY_MAP 1
         data.push(0x83); // TINY_STRING "key"
         data.extend_from_slice(b"key");
@@ -842,7 +865,7 @@ mod tests {
         data.push(1u8);
         data.push(2u8);
         data.push(3u8);
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.remaining(), 0);
     }
@@ -851,29 +874,25 @@ mod tests {
 
     #[test]
     fn unexpected_eof_empty() {
-        let data: [u8; 0] = [];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![]);
         assert_eq!(r.read_null(), Err(PackStreamError::UnexpectedEof));
     }
 
     #[test]
     fn unexpected_eof_truncated_int16() {
-        let data = [Marker::Int16.byte(), 0x03]; // missing second byte
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Int16.byte(), 0x03]); // missing second byte
         assert_eq!(r.read_int(), Err(PackStreamError::UnexpectedEof));
     }
 
     #[test]
     fn unexpected_eof_truncated_string() {
-        let data = [0x85, b'h', b'e']; // says 5 bytes but only 2 present
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0x85, b'h', b'e']); // says 5 bytes but only 2 present
         assert_eq!(r.read_string(), Err(PackStreamError::UnexpectedEof));
     }
 
     #[test]
     fn wrong_marker_for_bool() {
-        let data = [Marker::Null.byte()];
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![Marker::Null.byte()]);
         assert_eq!(
             r.read_bool(),
             Err(PackStreamError::InvalidMarker(Marker::Null.byte()))
@@ -882,8 +901,7 @@ mod tests {
 
     #[test]
     fn wrong_marker_for_float() {
-        let data = [0x42]; // tiny int, not float
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(vec![0x42]); // tiny int, not float
         assert_eq!(r.read_float(), Err(PackStreamError::InvalidMarker(0x42)));
     }
 
@@ -891,16 +909,14 @@ mod tests {
 
     #[test]
     fn peek_returns_next_byte() {
-        let data = [Marker::Null.byte(), Marker::True.byte()];
-        let r = PackStreamReader::new(&data);
+        let r = reader(vec![Marker::Null.byte(), Marker::True.byte()]);
         assert_eq!(r.peek(), Some(Marker::Null.byte()));
         assert_eq!(r.remaining(), 2);
     }
 
     #[test]
     fn peek_empty() {
-        let data: [u8; 0] = [];
-        let r = PackStreamReader::new(&data);
+        let r = reader(vec![]);
         assert_eq!(r.peek(), None);
     }
 
@@ -909,24 +925,19 @@ mod tests {
     #[test]
     fn read_multiple_values() {
         let mut data = Vec::new();
-        // null
         data.push(Marker::Null.byte());
-        // true
         data.push(Marker::True.byte());
-        // int 42
         data.push(42u8);
-        // string "hi"
         data.push(0x82);
         data.extend_from_slice(b"hi");
-        // float 1.0
         data.push(Marker::Float64.byte());
         data.extend_from_slice(&1.0f64.to_be_bytes());
 
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.read_null().unwrap();
-        assert_eq!(r.read_bool().unwrap(), true);
+        assert!(r.read_bool().unwrap());
         assert_eq!(r.read_int().unwrap(), 42);
-        assert_eq!(r.read_string().unwrap(), "hi");
+        assert_eq!(r.read_string().unwrap().as_str(), "hi");
         assert_eq!(r.read_float().unwrap(), 1.0);
         assert_eq!(r.remaining(), 0);
     }
@@ -936,26 +947,99 @@ mod tests {
         let s = "hello \u{1F600}"; // emoji
         let bytes = s.as_bytes();
         let len = bytes.len();
-        assert!(len <= 15); // fits in TINY_STRING
+        assert!(len <= 15);
         let mut data = vec![0x80 | len as u8];
         data.extend_from_slice(bytes);
-        let mut r = PackStreamReader::new(&data);
-        assert_eq!(r.read_string().unwrap(), s);
+        let mut r = reader(data);
+        assert_eq!(r.read_string().unwrap().as_str(), s);
     }
 
     #[test]
     fn skip_then_read() {
         let mut data = Vec::new();
-        // First value: string "skip me"
         data.push(0x87);
         data.extend_from_slice(b"skip me");
-        // Second value: int 99
         data.push(99u8);
 
-        let mut r = PackStreamReader::new(&data);
+        let mut r = reader(data);
         r.skip_value().unwrap();
         assert_eq!(r.read_int().unwrap(), 99);
         assert_eq!(r.remaining(), 0);
+    }
+
+    // ---- Multi-segment reads via MessageBuf ----
+
+    mod multi_segment {
+        use super::*;
+        use crate::protocol::chunking::MessageBuf;
+
+        /// Build a MessageBuf from explicit Bytes segments.
+        fn buf_from(chunks: Vec<Vec<u8>>) -> MessageBuf {
+            MessageBuf::from_chunks(chunks.into_iter().map(Bytes::from).collect())
+        }
+
+        #[test]
+        fn read_bytes_within_segment_is_zero_copy() {
+            // Payload + marker all in one segment → zero-copy slice.
+            let mut wire = vec![Marker::Bytes8.byte(), 4];
+            wire.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            let input = Bytes::from(wire);
+            let input_ptr = input.as_ptr();
+            let input_len = input.len();
+
+            let buf = MessageBuf::from_chunks(vec![input]);
+            let mut r = PackStreamReader::new(buf);
+            let b = r.read_bytes().unwrap();
+            let off = b.as_ptr() as usize - input_ptr as usize;
+            assert!(off < input_len, "should share allocation");
+        }
+
+        #[test]
+        fn read_bytes_across_segments_allocates_correctly() {
+            // First segment ends mid-payload; second has the rest.
+            let buf = buf_from(vec![
+                vec![Marker::Bytes8.byte(), 4, 0xDE, 0xAD], // marker, length, first 2 of payload
+                vec![0xBE, 0xEF],                           // last 2 of payload
+            ]);
+            let mut r = PackStreamReader::new(buf);
+            let b = r.read_bytes().unwrap();
+            assert_eq!(&b[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        }
+
+        #[test]
+        fn read_string_across_segments_validates_utf8() {
+            let buf = buf_from(vec![
+                vec![0x85, b'h', b'e'], // marker + first 2 chars
+                vec![b'l', b'l', b'o'], // last 3 chars
+            ]);
+            let mut r = PackStreamReader::new(buf);
+            assert_eq!(r.read_string().unwrap().as_str(), "hello");
+        }
+
+        #[test]
+        fn read_int_across_segments() {
+            // Int32 marker in segment 1, value bytes split across segments 1 and 2.
+            let buf = buf_from(vec![
+                vec![Marker::Int32.byte(), 0x00, 0x01], // marker + 2 of 4 value bytes
+                vec![0x86, 0xA0],                       // last 2 value bytes
+            ]);
+            let mut r = PackStreamReader::new(buf);
+            assert_eq!(r.read_int().unwrap(), 100_000);
+        }
+
+        #[test]
+        fn skip_value_across_segments() {
+            // String "skip me" + tiny int 99, payload bytes split across 3 segments.
+            let buf = buf_from(vec![
+                vec![0x87, b's', b'k'],
+                vec![b'i', b'p', b' '],
+                vec![b'm', b'e', 99u8],
+            ]);
+            let mut r = PackStreamReader::new(buf);
+            r.skip_value().unwrap();
+            assert_eq!(r.read_int().unwrap(), 99);
+            assert_eq!(r.remaining(), 0);
+        }
     }
 
     // ---- Round-trip tests (write with PackStreamWriter, read back) ----
@@ -964,12 +1048,15 @@ mod tests {
         use super::*;
         use crate::packstream::serialize::PackStreamWriter;
 
+        fn reader_from(w: PackStreamWriter) -> PackStreamReader<Bytes> {
+            PackStreamReader::new(w.into_bytes().freeze())
+        }
+
         #[test]
         fn null() {
             let mut w = PackStreamWriter::new();
             w.write_null();
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             r.read_null().unwrap();
             assert_eq!(r.remaining(), 0);
         }
@@ -979,10 +1066,9 @@ mod tests {
             let mut w = PackStreamWriter::new();
             w.write_bool(true);
             w.write_bool(false);
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
-            assert_eq!(r.read_bool().unwrap(), true);
-            assert_eq!(r.read_bool().unwrap(), false);
+            let mut r = reader_from(w);
+            assert!(r.read_bool().unwrap());
+            assert!(!r.read_bool().unwrap());
             assert_eq!(r.remaining(), 0);
         }
 
@@ -1008,8 +1094,7 @@ mod tests {
             for &v in values {
                 w.write_int(v);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for &v in values {
                 assert_eq!(r.read_int().unwrap(), v, "round-trip failed for {v}");
             }
@@ -1023,8 +1108,7 @@ mod tests {
             for &v in values {
                 w.write_float(v);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for &v in values {
                 assert_eq!(r.read_float().unwrap(), v);
             }
@@ -1045,10 +1129,9 @@ mod tests {
             for s in &strings {
                 w.write_string(s);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for s in &strings {
-                assert_eq!(r.read_string().unwrap(), *s);
+                assert_eq!(r.read_string().unwrap().as_str(), *s);
             }
             assert_eq!(r.remaining(), 0);
         }
@@ -1060,10 +1143,9 @@ mod tests {
             for b in payloads {
                 w.write_bytes(b);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for b in payloads {
-                assert_eq!(r.read_bytes().unwrap(), *b);
+                assert_eq!(&r.read_bytes().unwrap()[..], *b);
             }
             assert_eq!(r.remaining(), 0);
         }
@@ -1075,8 +1157,7 @@ mod tests {
             for &s in sizes {
                 w.write_list_header(s);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for &s in sizes {
                 assert_eq!(r.read_list_header().unwrap(), s);
             }
@@ -1090,8 +1171,7 @@ mod tests {
             for &s in sizes {
                 w.write_map_header(s);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for &s in sizes {
                 assert_eq!(r.read_map_header().unwrap(), s);
             }
@@ -1105,8 +1185,7 @@ mod tests {
             for &(tag, size) in cases {
                 w.write_struct_header(tag, size);
             }
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
             for &(tag, size) in cases {
                 let (t, s) = r.read_struct_header().unwrap();
                 assert_eq!(t, tag);
@@ -1117,7 +1196,6 @@ mod tests {
 
         #[test]
         fn composite_map() {
-            // Write a map {"name": "Alice", "age": 30, "scores": [95, 87]}
             let mut w = PackStreamWriter::new();
             w.write_map_header(3);
             w.write_string("name");
@@ -1129,15 +1207,14 @@ mod tests {
             w.write_int(95);
             w.write_int(87);
 
-            let buf = w.into_bytes();
-            let mut r = PackStreamReader::new(&buf);
+            let mut r = reader_from(w);
 
             assert_eq!(r.read_map_header().unwrap(), 3);
-            assert_eq!(r.read_string().unwrap(), "name");
-            assert_eq!(r.read_string().unwrap(), "Alice");
-            assert_eq!(r.read_string().unwrap(), "age");
+            assert_eq!(r.read_string().unwrap().as_str(), "name");
+            assert_eq!(r.read_string().unwrap().as_str(), "Alice");
+            assert_eq!(r.read_string().unwrap().as_str(), "age");
             assert_eq!(r.read_int().unwrap(), 30);
-            assert_eq!(r.read_string().unwrap(), "scores");
+            assert_eq!(r.read_string().unwrap().as_str(), "scores");
             assert_eq!(r.read_list_header().unwrap(), 2);
             assert_eq!(r.read_int().unwrap(), 95);
             assert_eq!(r.read_int().unwrap(), 87);
