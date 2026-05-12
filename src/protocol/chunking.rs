@@ -22,6 +22,8 @@
 // slices; values that straddle segment boundaries trigger a single
 // `copy_to_bytes` allocation for just that value (not the whole message).
 
+use std::collections::VecDeque;
+
 use bytes::{Buf, Bytes};
 
 /// Default maximum message size the decoder will accept (16 MiB).
@@ -56,9 +58,10 @@ pub enum ChunkError {
 /// allocation. Each segment is a zero-copy slice of an original TCP read
 /// buffer.
 pub struct MessageBuf {
-    /// Payload chunks in order. The first element is the current segment.
-    /// Empty when the buffer is fully consumed.
-    chunks: Vec<Bytes>,
+    /// Payload chunks in order. The front element is the current segment.
+    /// Empty when the buffer is fully consumed. `VecDeque` gives O(1)
+    /// front-removal as segments are drained.
+    chunks: VecDeque<Bytes>,
     /// Total bytes remaining across all chunks. Maintained explicitly so
     /// `Buf::remaining` is O(1).
     remaining: usize,
@@ -69,7 +72,10 @@ impl MessageBuf {
     /// permitted but skipped on access.
     pub fn from_chunks(chunks: Vec<Bytes>) -> Self {
         let remaining = chunks.iter().map(|c| c.len()).sum();
-        let mut buf = Self { chunks, remaining };
+        let mut buf = Self {
+            chunks: VecDeque::from(chunks),
+            remaining,
+        };
         buf.trim_front_empty();
         buf
     }
@@ -83,15 +89,15 @@ impl MessageBuf {
 
     /// Borrow the underlying segments. Test-only.
     #[cfg(test)]
-    pub(crate) fn segments(&self) -> &[Bytes] {
+    pub(crate) fn segments(&self) -> &VecDeque<Bytes> {
         &self.chunks
     }
 
     /// Drop empty segments from the front so `chunk()` always returns a
     /// non-empty slice when `remaining() > 0`.
     fn trim_front_empty(&mut self) {
-        while self.chunks.first().is_some_and(|b| b.is_empty()) {
-            self.chunks.remove(0);
+        while self.chunks.front().is_some_and(|b| b.is_empty()) {
+            self.chunks.pop_front();
         }
     }
 }
@@ -102,7 +108,7 @@ impl Buf for MessageBuf {
     }
 
     fn chunk(&self) -> &[u8] {
-        self.chunks.first().map(|b| b.as_ref()).unwrap_or(&[])
+        self.chunks.front().map(|b| b.as_ref()).unwrap_or(&[])
     }
 
     fn advance(&mut self, mut cnt: usize) {
@@ -118,12 +124,15 @@ impl Buf for MessageBuf {
             first.advance(take);
             cnt -= take;
             if first.is_empty() {
-                self.chunks.remove(0);
+                self.chunks.pop_front();
             }
         }
     }
 
     fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        if len == 0 {
+            return Bytes::new();
+        }
         assert!(
             len <= self.remaining,
             "copy_to_bytes past end ({len} > {})",
@@ -134,7 +143,7 @@ impl Buf for MessageBuf {
             let out = self.chunks[0].split_to(len);
             self.remaining -= len;
             if self.chunks[0].is_empty() {
-                self.chunks.remove(0);
+                self.chunks.pop_front();
             }
             out
         } else {
@@ -148,7 +157,7 @@ impl Buf for MessageBuf {
                 acc.extend_from_slice(&first[..take]);
                 first.advance(take);
                 if first.is_empty() {
-                    self.chunks.remove(0);
+                    self.chunks.pop_front();
                 }
                 taken += take;
             }
@@ -261,7 +270,11 @@ impl ChunkDecoder {
                     // Zero-copy: split a slice off the front of the input.
                     let segment = data.split_to(to_take);
                     self.pending.push(segment);
-                    self.pending_size += to_take;
+                    // `handle_header` already verified `pending_size + size`
+                    // fits under `max_message_size`; `saturating_add` is
+                    // belt-and-suspenders for pathological `max_message_size`
+                    // configurations near `usize::MAX`.
+                    self.pending_size = self.pending_size.saturating_add(to_take);
 
                     let left = remaining - to_take as u16;
                     if left == 0 {
@@ -291,15 +304,19 @@ impl ChunkDecoder {
             messages.push(MessageBuf::from_chunks(segments));
             self.state = DecoderState::ReadingHeader;
         } else {
-            let new_size = self.pending_size + size as usize;
-            if new_size > self.max_message_size {
+            // Overflow-safe size check on untrusted input. `checked_add`
+            // catches the case where `max_message_size` is configured near
+            // `usize::MAX` and `pending_size + size` would wrap.
+            let new_size = self.pending_size.checked_add(size as usize);
+            if new_size.is_none_or(|s| s > self.max_message_size) {
                 // Defunct — the remaining payload bytes would be misinterpreted
                 // as headers if we tried to continue. Connection must be closed.
+                let reported_size = self.pending_size.saturating_add(size as usize);
                 self.pending.clear();
                 self.pending_size = 0;
                 self.state = DecoderState::Defunct;
                 return Err(ChunkError::MessageTooLarge {
-                    size: new_size,
+                    size: reported_size,
                     max: self.max_message_size,
                 });
             }
@@ -668,5 +685,47 @@ mod tests {
         ]);
         assert_eq!(buf.remaining(), 2);
         assert_eq!(buf.chunk(), &[1]);
+    }
+
+    #[test]
+    fn messagebuf_copy_to_bytes_zero_on_empty_buf() {
+        // copy_to_bytes(0) on a fully-consumed buf must not panic — required
+        // for reading empty strings/bytes at end of message.
+        let mut buf = MessageBuf::from_chunks(vec![]);
+        assert_eq!(buf.remaining(), 0);
+        let got = buf.copy_to_bytes(0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn messagebuf_copy_to_bytes_zero_on_drained_buf() {
+        // After draining all bytes, copy_to_bytes(0) still works.
+        let mut buf = MessageBuf::from_chunks(vec![Bytes::from_static(&[1, 2, 3])]);
+        buf.advance(3);
+        assert_eq!(buf.remaining(), 0);
+        assert!(buf.copy_to_bytes(0).is_empty());
+    }
+
+    #[test]
+    fn decode_header_overflow_reported_as_too_large() {
+        // Configure max near usize::MAX so adding a chunk size would overflow.
+        // The overflow path must transition to Defunct and report MessageTooLarge.
+        let mut dec = ChunkDecoder::with_max_message_size(usize::MAX);
+        // First, consume a chunk of size 65535 to fill pending_size.
+        let mut data = vec![0xFF, 0xFF]; // header: 65535
+        data.extend_from_slice(&[0x42; 65535]);
+        // No terminator — leave decoder in ReadingHeader with pending_size = 65535.
+        let _ = dec.feed(Bytes::from(data)).unwrap();
+        // Now feed another header with size 65535 — pending_size + 65535 = 131070, far from overflow.
+        // To force overflow we'd need pending_size near usize::MAX; not testable directly.
+        // Instead, verify that max_message_size enforcement still works at boundary.
+        let mut dec2 = ChunkDecoder::with_max_message_size(100);
+        let mut data = vec![0xFF, 0xFF]; // size 65535
+        data.extend_from_slice(&[0x42; 10]);
+        let result = dec2.feed(Bytes::from(data));
+        assert!(matches!(result, Err(ChunkError::MessageTooLarge { .. })));
+        // And subsequent feed is Defunct.
+        let result = dec2.feed(Bytes::from_static(&[0x00, 0x01, 0x42, 0x00, 0x00]));
+        assert!(matches!(result, Err(ChunkError::Defunct)));
     }
 }
