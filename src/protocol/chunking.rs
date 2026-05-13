@@ -1,12 +1,12 @@
-// Bolt chunked transfer encoding — framing layer for PackStream messages.
+// Bolt chunked transfer — read-side de-chunker (decoder).
 //
 // Every Bolt message on the wire is wrapped in one or more chunks:
 //   Chunk     = [u16 BE size][size bytes of payload]
 //   EndMarker = [0x00, 0x00]
 //   Message   = Chunk+ EndMarker
 //
-// This module provides only the read-side de-chunker. The encode side will be
-// fused into the writer (issue #10/#11) so framing happens during PackStream
+// This module implements only the decoder. The encoder will be fused into
+// the writer (see issue #39) so framing happens during PackStream
 // serialization with no intermediate buffer copy.
 //
 // # Streaming architecture
@@ -21,6 +21,7 @@
 // variable-length values that fit within a single segment are zero-copy
 // slices; values that straddle segment boundaries trigger a single
 // `copy_to_bytes` allocation for just that value (not the whole message).
+// See issue #38 for a path to eliminate even that allocation.
 
 use std::collections::VecDeque;
 
@@ -28,6 +29,18 @@ use bytes::{Buf, Bytes};
 
 /// Default maximum message size the decoder will accept (16 MiB).
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Default maximum number of segments per message.
+///
+/// A segment is a `Bytes` reference accumulated for the current message;
+/// each chunk's payload may contribute multiple segments if it arrives
+/// fragmented across `feed()` calls. The cap bounds the worst-case
+/// memory and CPU spent on bookkeeping when an untrusted peer sends a
+/// flood of tiny chunks that individually fit under `max_message_size`.
+///
+/// With the default 16 MiB message size and a 1024-segment cap, the
+/// attacker must use average chunk fragments of at least 16 KiB.
+pub const DEFAULT_MAX_SEGMENTS_PER_MESSAGE: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -40,6 +53,11 @@ pub enum ChunkError {
     /// The decoder is now defunct and the connection must be closed.
     #[error("message size {size} exceeds maximum allowed size {max}")]
     MessageTooLarge { size: usize, max: usize },
+    /// The accumulated message exceeded the configured maximum segment
+    /// count — an untrusted peer is sending too many tiny chunks. The
+    /// decoder is now defunct and the connection must be closed.
+    #[error("message segment count {segments} exceeds maximum {max}")]
+    TooManySegments { segments: usize, max: usize },
     /// The decoder is in a defunct state after a previous fatal error.
     /// The connection must be closed and a new decoder created.
     #[error("decoder is defunct after a previous error")]
@@ -202,16 +220,21 @@ pub struct ChunkDecoder {
     state: DecoderState,
     /// Maximum allowed message size in bytes.
     max_message_size: usize,
+    /// Maximum allowed segment count per message (DoS guard against tiny
+    /// fragments).
+    max_segments_per_message: usize,
 }
 
 impl ChunkDecoder {
-    /// Create a new decoder with the default max message size (16 MiB).
+    /// Create a new decoder with default limits (16 MiB message size,
+    /// 1024 segments per message).
     pub fn new() -> Self {
         Self {
             pending: Vec::new(),
             pending_size: 0,
             state: DecoderState::ReadingHeader,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_segments_per_message: DEFAULT_MAX_SEGMENTS_PER_MESSAGE,
         }
     }
 
@@ -222,7 +245,14 @@ impl ChunkDecoder {
             pending_size: 0,
             state: DecoderState::ReadingHeader,
             max_message_size: max,
+            max_segments_per_message: DEFAULT_MAX_SEGMENTS_PER_MESSAGE,
         }
+    }
+
+    /// Set the maximum segment count per message. Builder-style.
+    pub fn with_max_segments_per_message(mut self, max: usize) -> Self {
+        self.max_segments_per_message = max;
+        self
     }
 
     /// Feed raw bytes from the wire. Returns any complete de-chunked messages.
@@ -237,6 +267,10 @@ impl ChunkDecoder {
     /// Returns [`ChunkError::MessageTooLarge`] if the accumulated message
     /// exceeds the configured maximum size. The decoder becomes defunct
     /// after this error — the connection must be closed.
+    ///
+    /// Returns [`ChunkError::TooManySegments`] if the accumulated message
+    /// exceeds the configured maximum segment count (DoS guard against
+    /// floods of tiny chunks). The decoder becomes defunct.
     ///
     /// Returns [`ChunkError::Defunct`] if the decoder was already in a
     /// defunct state from a previous error.
@@ -276,6 +310,18 @@ impl ChunkDecoder {
                     // belt-and-suspenders for pathological `max_message_size`
                     // configurations near `usize::MAX`.
                     self.pending_size = self.pending_size.saturating_add(to_take);
+
+                    // DoS guard: cap the number of segments per message to
+                    // bound the cost of an attacker sending many tiny chunks
+                    // that individually fit under `max_message_size`.
+                    if self.pending.len() > self.max_segments_per_message {
+                        let segments = self.pending.len();
+                        let max = self.max_segments_per_message;
+                        self.pending.clear();
+                        self.pending_size = 0;
+                        self.state = DecoderState::Defunct;
+                        return Err(ChunkError::TooManySegments { segments, max });
+                    }
 
                     let left = remaining - to_take as u16;
                     if left == 0 {
@@ -739,6 +785,38 @@ mod tests {
         buf.advance(3);
         assert_eq!(buf.remaining(), 0);
         assert!(buf.copy_to_bytes(0).is_empty());
+    }
+
+    #[test]
+    fn decode_too_many_segments_rejected() {
+        // Attacker sends many 1-byte chunks: each individually fits under
+        // max_message_size, but the segment count balloons. The decoder
+        // must reject once `max_segments_per_message` is exceeded and
+        // transition to Defunct.
+        let mut dec = ChunkDecoder::new().with_max_segments_per_message(4);
+        // Build a wire stream of five 1-byte chunks, each in its own feed.
+        // Each feed contributes header + 1 payload byte; the payload byte
+        // pushes one segment to `pending`.
+        for i in 0..4 {
+            match dec.feed(Bytes::from(vec![0x00, 0x01, i as u8])) {
+                Ok(msgs) if msgs.is_empty() => {}
+                Ok(_) => panic!("feed {i}: unexpected complete message"),
+                Err(e) => panic!("feed {i}: unexpected error: {e}"),
+            }
+        }
+        // Fifth segment exceeds the cap.
+        let result = dec.feed(Bytes::from_static(&[0x00, 0x01, 0xFF]));
+        match result {
+            Err(ChunkError::TooManySegments { segments, max }) => {
+                assert_eq!(segments, 5);
+                assert_eq!(max, 4);
+            }
+            Err(e) => panic!("expected TooManySegments, got error: {e}"),
+            Ok(_) => panic!("expected TooManySegments, got Ok"),
+        }
+        // Subsequent feeds are Defunct.
+        let result = dec.feed(Bytes::from_static(&[0x00, 0x00]));
+        assert!(matches!(result, Err(ChunkError::Defunct)));
     }
 
     #[test]
