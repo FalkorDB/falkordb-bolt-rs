@@ -68,16 +68,25 @@ pub struct MessageBuf {
 }
 
 impl MessageBuf {
-    /// Construct from a list of payload segments. Empty segments are
-    /// permitted but skipped on access.
+    /// Construct from a list of payload segments.
+    ///
+    /// Empty segments in the input are filtered out — the internal
+    /// invariant is that `chunks` never contains an empty `Bytes`. This
+    /// keeps `chunk()` non-empty whenever `remaining() > 0` without
+    /// needing to re-trim after every pop in `advance`/`copy_to_bytes`.
     pub fn from_chunks(chunks: Vec<Bytes>) -> Self {
-        let remaining = chunks.iter().map(|c| c.len()).sum();
-        let mut buf = Self {
-            chunks: VecDeque::from(chunks),
+        let mut filtered = VecDeque::with_capacity(chunks.len());
+        let mut remaining = 0usize;
+        for c in chunks {
+            if !c.is_empty() {
+                remaining = remaining.saturating_add(c.len());
+                filtered.push_back(c);
+            }
+        }
+        Self {
+            chunks: filtered,
             remaining,
-        };
-        buf.trim_front_empty();
-        buf
+        }
     }
 
     /// Number of underlying segments (not bytes). Used by tests to verify
@@ -91,14 +100,6 @@ impl MessageBuf {
     #[cfg(test)]
     pub(crate) fn segments(&self) -> &VecDeque<Bytes> {
         &self.chunks
-    }
-
-    /// Drop empty segments from the front so `chunk()` always returns a
-    /// non-empty slice when `remaining() > 0`.
-    fn trim_front_empty(&mut self) {
-        while self.chunks.front().is_some_and(|b| b.is_empty()) {
-            self.chunks.pop_front();
-        }
     }
 }
 
@@ -677,14 +678,48 @@ mod tests {
 
     #[test]
     fn messagebuf_empty_chunks_are_skipped() {
-        let buf = MessageBuf::from_chunks(vec![
+        // Empty segments anywhere in the input (front, middle, trailing) must
+        // be filtered out so the invariant `chunk() non-empty iff remaining > 0`
+        // holds throughout advance / copy_to_bytes.
+        let mut buf = MessageBuf::from_chunks(vec![
             Bytes::new(),
             Bytes::from_static(&[1]),
             Bytes::new(),
             Bytes::from_static(&[2]),
+            Bytes::new(),
         ]);
         assert_eq!(buf.remaining(), 2);
+        assert_eq!(buf.segment_count(), 2);
         assert_eq!(buf.chunk(), &[1]);
+        buf.advance(1);
+        // After consuming the first segment, the next must still be non-empty
+        // (middle Bytes::new() was filtered at construction).
+        assert_eq!(buf.remaining(), 1);
+        assert_eq!(buf.chunk(), &[2]);
+        buf.advance(1);
+        assert_eq!(buf.remaining(), 0);
+        assert!(buf.chunk().is_empty());
+    }
+
+    #[test]
+    fn messagebuf_chunk_non_empty_invariant_during_drain() {
+        // While remaining() > 0, chunk() must always return a non-empty slice
+        // so loops like `while has_remaining { advance(chunk().len()) }` make
+        // forward progress.
+        let mut buf = MessageBuf::from_chunks(vec![
+            Bytes::from_static(&[1, 2]),
+            Bytes::from_static(&[3]),
+            Bytes::from_static(&[4, 5, 6]),
+        ]);
+        let mut steps = 0;
+        while buf.has_remaining() {
+            let n = buf.chunk().len();
+            assert!(n > 0, "chunk() must be non-empty while remaining > 0");
+            buf.advance(n);
+            steps += 1;
+            assert!(steps < 10, "loop is not making progress");
+        }
+        assert_eq!(buf.remaining(), 0);
     }
 
     #[test]
@@ -707,25 +742,24 @@ mod tests {
     }
 
     #[test]
-    fn decode_header_overflow_reported_as_too_large() {
-        // Configure max near usize::MAX so adding a chunk size would overflow.
-        // The overflow path must transition to Defunct and report MessageTooLarge.
-        let mut dec = ChunkDecoder::with_max_message_size(usize::MAX);
-        // First, consume a chunk of size 65535 to fill pending_size.
-        let mut data = vec![0xFF, 0xFF]; // header: 65535
-        data.extend_from_slice(&[0x42; 65535]);
-        // No terminator — leave decoder in ReadingHeader with pending_size = 65535.
-        let _ = dec.feed(Bytes::from(data)).unwrap();
-        // Now feed another header with size 65535 — pending_size + 65535 = 131070, far from overflow.
-        // To force overflow we'd need pending_size near usize::MAX; not testable directly.
-        // Instead, verify that max_message_size enforcement still works at boundary.
-        let mut dec2 = ChunkDecoder::with_max_message_size(100);
-        let mut data = vec![0xFF, 0xFF]; // size 65535
+    fn decode_oversized_chunk_rejected_at_header() {
+        // A chunk whose header announces a size > max_message_size is
+        // rejected immediately on header parse — before any payload bytes
+        // are accepted — and transitions the decoder to Defunct.
+        //
+        // Note: the `checked_add` guard in `handle_header` also defends
+        // against `pending_size + size` wrapping when `max_message_size`
+        // is configured near `usize::MAX`, but constructing that scenario
+        // requires accumulating ~usize::MAX bytes which is not feasible
+        // in a unit test. The guard is exercised by the code path here;
+        // its overflow behavior is verified by inspection.
+        let mut dec = ChunkDecoder::with_max_message_size(100);
+        let mut data = vec![0xFF, 0xFF]; // header announces size 65535 > max 100
         data.extend_from_slice(&[0x42; 10]);
-        let result = dec2.feed(Bytes::from(data));
+        let result = dec.feed(Bytes::from(data));
         assert!(matches!(result, Err(ChunkError::MessageTooLarge { .. })));
-        // And subsequent feed is Defunct.
-        let result = dec2.feed(Bytes::from_static(&[0x00, 0x01, 0x42, 0x00, 0x00]));
+        // Subsequent feeds return Defunct.
+        let result = dec.feed(Bytes::from_static(&[0x00, 0x01, 0x42, 0x00, 0x00]));
         assert!(matches!(result, Err(ChunkError::Defunct)));
     }
 }

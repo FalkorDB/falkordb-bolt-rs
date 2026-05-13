@@ -63,10 +63,18 @@ impl AsRef<str> for PackStreamString {
 /// Reads PackStream-encoded data from any [`Buf`] source.
 ///
 /// Variable-length values (`read_string`, `read_bytes`) return refcounted
-/// [`Bytes`] / [`PackStreamString`]. When the value fits within the
-/// current segment of the underlying `Buf` (the typical case), the returned
-/// bytes share the source allocation — zero copy. When a value straddles
-/// segment boundaries, one allocation copies the value into a fresh buffer.
+/// [`Bytes`] / [`PackStreamString`] via [`Buf::copy_to_bytes`]. The
+/// allocation behavior depends on the underlying `Buf`:
+///
+/// - For [`Bytes`] and [`crate::protocol::chunking::MessageBuf`] (the
+///   production sources): `copy_to_bytes` returns a refcounted slice that
+///   shares the source allocation — zero copy — when the value fits in
+///   one segment. Straddling values incur one allocation for just that
+///   value.
+/// - For generic `Buf` impls that don't own their bytes (e.g. `&[u8]`,
+///   `std::io::Cursor`): `copy_to_bytes` always allocates a fresh `Bytes`,
+///   even within a single segment. Use one of the refcounted sources
+///   above if zero-copy is required.
 ///
 /// All multi-byte integer reads use the `Buf` trait's big-endian getters —
 /// safe across segment boundaries and on strict-alignment architectures.
