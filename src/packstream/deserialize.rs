@@ -21,7 +21,9 @@ pub enum PackStreamError {
 /// A UTF-8-valid string backed by a refcounted [`Bytes`].
 ///
 /// Cheap to clone (Arc refcount bump). Derefs to `&str` for ergonomic use.
-/// The UTF-8 invariant is enforced when constructed by [`PackStreamReader::read_string`].
+/// The UTF-8 invariant is upheld by every constructor — safe constructors
+/// validate; the unchecked one (`from_utf8_unchecked`) is `pub(crate)` and
+/// requires the caller to have already validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackStreamString(Bytes);
 
@@ -29,15 +31,16 @@ impl PackStreamString {
     /// Construct from already-validated UTF-8 bytes.
     ///
     /// # Safety
-    /// The caller must guarantee `bytes` is valid UTF-8. Used internally by
-    /// the reader after `std::str::from_utf8` succeeds.
+    /// The caller must guarantee `bytes` is valid UTF-8. Used internally
+    /// where validation has already happened (e.g. tests, fast paths).
+    /// For external use, prefer [`TryFrom<Bytes>`](#impl-TryFrom<Bytes>-for-PackStreamString).
     pub(crate) unsafe fn from_utf8_unchecked(bytes: Bytes) -> Self {
         Self(bytes)
     }
 
     /// View as `&str`. No allocation, no copy.
     pub fn as_str(&self) -> &str {
-        // SAFETY: invariant enforced at construction by `read_string`.
+        // SAFETY: invariant upheld at construction by every public path.
         unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 
@@ -57,6 +60,26 @@ impl std::ops::Deref for PackStreamString {
 impl AsRef<str> for PackStreamString {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl From<PackStreamString> for Bytes {
+    fn from(s: PackStreamString) -> Bytes {
+        s.0
+    }
+}
+
+impl TryFrom<Bytes> for PackStreamString {
+    type Error = std::str::Utf8Error;
+
+    /// Wrap a [`Bytes`] as a `PackStreamString`, validating UTF-8.
+    ///
+    /// Returns the validation error if `bytes` is not valid UTF-8. On
+    /// success, the returned value shares the input allocation — zero copy.
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        std::str::from_utf8(&bytes)?;
+        // SAFETY: validated immediately above.
+        Ok(unsafe { Self::from_utf8_unchecked(bytes) })
     }
 }
 
@@ -267,14 +290,12 @@ impl<B: Buf> PackStreamReader<B> {
     ///
     /// Zero-copy when the value fits within a single segment of the
     /// underlying `Buf`. Allocates once when the value straddles segments.
-    /// UTF-8 is validated before return.
+    /// UTF-8 is validated by [`PackStreamString::try_from`] before return.
     pub fn read_string(&mut self) -> Result<PackStreamString, PackStreamError> {
         let marker = self.read_marker()?;
         let len = self.string_len(marker)?;
         let bytes = self.read_exact_bytes(len)?;
-        std::str::from_utf8(&bytes).map_err(|_| PackStreamError::InvalidUtf8)?;
-        // SAFETY: validated immediately above.
-        Ok(unsafe { PackStreamString::from_utf8_unchecked(bytes) })
+        PackStreamString::try_from(bytes).map_err(|_| PackStreamError::InvalidUtf8)
     }
 
     /// Read a byte array as refcounted [`Bytes`].
@@ -590,6 +611,63 @@ mod tests {
         data.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
         let mut r = reader(data);
         assert_eq!(r.read_string(), Err(PackStreamError::InvalidUtf8));
+    }
+
+    // ---- PackStreamString conversion impls ----
+
+    #[test]
+    fn pack_stream_string_try_from_valid_bytes() {
+        let bytes = Bytes::from_static(b"hello");
+        let pss = PackStreamString::try_from(bytes).unwrap();
+        assert_eq!(pss.as_str(), "hello");
+    }
+
+    #[test]
+    fn pack_stream_string_try_from_invalid_utf8_fails() {
+        let bytes = Bytes::from_static(&[0xFF, 0xFE]);
+        assert!(PackStreamString::try_from(bytes).is_err());
+    }
+
+    #[test]
+    fn pack_stream_string_try_from_zero_copy() {
+        // try_from must share the input allocation — no copy.
+        let bytes = Bytes::from(b"hello world".to_vec());
+        let in_ptr = bytes.as_ptr();
+        let pss = PackStreamString::try_from(bytes).unwrap();
+        assert_eq!(pss.as_str().as_ptr() as usize, in_ptr as usize);
+    }
+
+    #[test]
+    fn pack_stream_string_into_bytes_round_trips() {
+        let bytes_in = Bytes::from_static(b"round trip");
+        let in_ptr = bytes_in.as_ptr();
+        let pss = PackStreamString::try_from(bytes_in).unwrap();
+        let bytes_out: Bytes = pss.into();
+        // From conversion must also preserve the allocation.
+        assert_eq!(bytes_out.as_ptr() as usize, in_ptr as usize);
+        assert_eq!(&bytes_out[..], b"round trip");
+    }
+
+    #[test]
+    fn pack_stream_string_as_ref_str() {
+        // Verifies the AsRef<str> impl works in a generic bound — the
+        // canonical Rust-idiomatic use case for the trait.
+        fn take_strlike<S: AsRef<str>>(s: S) -> usize {
+            s.as_ref().len()
+        }
+        let pss = PackStreamString::try_from(Bytes::from_static(b"hello")).unwrap();
+        assert_eq!(take_strlike(&pss), 5);
+        // Also works by value.
+        assert_eq!(take_strlike(pss), 5);
+    }
+
+    #[test]
+    fn pack_stream_string_deref_to_str() {
+        // Verifies Deref<Target=str> — methods and coercions work through &.
+        let pss = PackStreamString::try_from(Bytes::from_static(b"hello")).unwrap();
+        assert_eq!(pss.len(), 5);
+        assert!(pss.starts_with("he"));
+        let _slice: &str = &pss;
     }
 
     #[test]
