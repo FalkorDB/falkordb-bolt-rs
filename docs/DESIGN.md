@@ -526,18 +526,26 @@ pub struct BoltVersion {
 #### `protocol/chunking.rs`
 
 Read side only — the de-chunker that reassembles framed wire bytes into
-multi-segment message payloads. The encode side is fused into the writer
-(`protocol/messages.rs` / writer layer) so framing happens during PackStream
+multi-segment message payloads. The encode side will be fused into the
+writer (tracked in issue #39) so framing happens during PackStream
 serialization with no intermediate buffer copy.
 
 ```rust
 use bytes::{Buf, Bytes};
+use std::collections::VecDeque;
 
 /// A complete Bolt message's payload, as one or more refcounted Bytes
 /// segments. Implements `bytes::Buf`, so `PackStreamReader<MessageBuf>`
 /// walks the segments without materializing them into a contiguous buffer.
 /// Every segment is a zero-copy slice of an original TCP read buffer.
-pub struct MessageBuf { /* private: Vec<Bytes> */ }
+///
+/// Storage is `VecDeque<Bytes>` so front-draining (during `advance` /
+/// `copy_to_bytes`) is O(1); empty segments are filtered at construction
+/// so `chunk()` is non-empty whenever `remaining() > 0`.
+pub struct MessageBuf {
+    chunks: VecDeque<Bytes>,
+    remaining: usize,            // running total — O(1) `Buf::remaining`
+}
 
 impl bytes::Buf for MessageBuf {
     fn remaining(&self) -> usize;
@@ -552,6 +560,7 @@ pub struct ChunkDecoder { /* private */ }
 impl ChunkDecoder {
     pub fn new() -> Self;
     pub fn with_max_message_size(max: usize) -> Self;
+    pub fn with_max_segments_per_message(self, max: usize) -> Self;
 
     /// Feed raw bytes. Returns complete de-chunked messages.
     ///
@@ -563,14 +572,17 @@ impl ChunkDecoder {
 }
 
 pub enum ChunkError {
-    MessageTooLarge { size: usize, max: usize }, // → Defunct
+    MessageTooLarge { size: usize, max: usize },       // → Defunct
+    TooManySegments { segments: usize, max: usize },   // → Defunct (DoS guard)
     Defunct,
 }
 ```
 
-`MessageTooLarge` transitions the decoder to a `Defunct` state — any
-subsequent `feed` returns `ChunkError::Defunct`. The connection must be
-closed; the byte stream cannot be safely resynced.
+`MessageTooLarge` and `TooManySegments` both transition the decoder to a
+`Defunct` state — any subsequent `feed` returns `ChunkError::Defunct`. The
+connection must be closed; the byte stream cannot be safely resynced.
+`TooManySegments` is a DoS guard against peers sending floods of tiny
+chunks that individually fit under `max_message_size`.
 
 ---
 
