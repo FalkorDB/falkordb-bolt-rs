@@ -983,7 +983,7 @@ mod tests {
 
         /// Build a MessageBuf from explicit Bytes segments.
         fn buf_from(chunks: Vec<Vec<u8>>) -> MessageBuf {
-            MessageBuf::from_chunks(chunks.into_iter().map(Bytes::from).collect())
+            MessageBuf::from_chunks(chunks.into_iter().map(Bytes::from))
         }
 
         #[test]

@@ -86,16 +86,25 @@ pub struct MessageBuf {
 }
 
 impl MessageBuf {
-    /// Construct from a list of payload segments.
+    /// Construct from any iterable of payload segments.
+    ///
+    /// Accepts `Vec<Bytes>`, `VecDeque<Bytes>`, `Vec<Bytes>::drain(..)`,
+    /// or any other `IntoIterator<Item = Bytes>` — the latter is what
+    /// the decoder uses to move segments out of its internal `pending`
+    /// list without dropping `pending`'s capacity across messages.
     ///
     /// Empty segments in the input are filtered out — the internal
     /// invariant is that `chunks` never contains an empty `Bytes`. This
     /// keeps `chunk()` non-empty whenever `remaining() > 0` without
     /// needing to re-trim after every pop in `advance`/`copy_to_bytes`.
-    pub fn from_chunks(chunks: Vec<Bytes>) -> Self {
-        let mut filtered = VecDeque::with_capacity(chunks.len());
+    pub fn from_chunks<I>(chunks: I) -> Self
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        let iter = chunks.into_iter();
+        let mut filtered = VecDeque::with_capacity(iter.size_hint().0);
         let mut remaining = 0usize;
-        for c in chunks {
+        for c in iter {
             if !c.is_empty() {
                 remaining = remaining.saturating_add(c.len());
                 filtered.push_back(c);
@@ -255,6 +264,13 @@ impl ChunkDecoder {
         self
     }
 
+    /// Allocation capacity of the internal pending-segments buffer.
+    /// Test-only — used to verify capacity is preserved across messages.
+    #[cfg(test)]
+    pub(crate) fn pending_capacity(&self) -> usize {
+        self.pending.capacity()
+    }
+
     /// Feed raw bytes from the wire. Returns any complete de-chunked messages.
     ///
     /// A single `feed` call may return zero, one, or multiple messages
@@ -344,11 +360,13 @@ impl ChunkDecoder {
         messages: &mut Vec<MessageBuf>,
     ) -> Result<(), ChunkError> {
         if size == 0 {
-            // Zero-chunk = end of message. Emit a MessageBuf over the
-            // accumulated segments.
-            let segments = std::mem::take(&mut self.pending);
+            // Zero-chunk = end of message. Drain pending into a new
+            // MessageBuf — `drain(..)` preserves `pending`'s allocation
+            // capacity across messages, so steady-state per-message
+            // allocations are bounded to a single VecDeque inside the
+            // emitted MessageBuf (no recurring Vec re-growth).
+            messages.push(MessageBuf::from_chunks(self.pending.drain(..)));
             self.pending_size = 0;
-            messages.push(MessageBuf::from_chunks(segments));
             self.state = DecoderState::ReadingHeader;
         } else {
             // Overflow-safe size check on untrusted input. `checked_add`
@@ -785,6 +803,39 @@ mod tests {
         buf.advance(3);
         assert_eq!(buf.remaining(), 0);
         assert!(buf.copy_to_bytes(0).is_empty());
+    }
+
+    #[test]
+    fn decode_preserves_pending_capacity_across_messages() {
+        // After emitting a message, the decoder's internal `pending` Vec
+        // must retain its allocation capacity so subsequent messages don't
+        // re-grow it. We can't observe `pending` directly (it's private)
+        // but we can verify the behavior by sending two single-chunk
+        // messages and checking that the decoder handles them identically
+        // — and inspect the capacity via a test-only accessor.
+        let mut dec = ChunkDecoder::new();
+        // First message: a 4-segment payload (via fragmented feeds).
+        for &b in &[0x00u8, 0x04, 0x01, 0x02] {
+            let _ = dec.feed(Bytes::copy_from_slice(&[b])).unwrap();
+        }
+        for &b in &[0x03u8, 0x04] {
+            let _ = dec.feed(Bytes::copy_from_slice(&[b])).unwrap();
+        }
+        let _ = dec.feed(Bytes::from_static(&[0x00, 0x00])).unwrap();
+        let cap_after_first = dec.pending_capacity();
+        assert!(
+            cap_after_first >= 4,
+            "pending should retain capacity for ≥4 segments after first message, got {cap_after_first}"
+        );
+        // Second message: 1-segment, single feed.
+        let _ = dec
+            .feed(Bytes::from_static(&[0x00, 0x02, 0xAA, 0xBB, 0x00, 0x00]))
+            .unwrap();
+        let cap_after_second = dec.pending_capacity();
+        assert!(
+            cap_after_second >= cap_after_first,
+            "pending capacity must not shrink between messages ({cap_after_first} → {cap_after_second})"
+        );
     }
 
     #[test]
