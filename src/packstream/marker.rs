@@ -31,33 +31,18 @@ pub enum Marker {
 }
 
 /// Errors related to marker construction, encoding, or decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MarkerError {
     /// The byte does not correspond to any valid PackStream marker.
+    #[error("invalid PackStream marker: 0x{0:02X}")]
     InvalidByte(u8),
     /// TinyInt value is outside the valid range (-16..=127).
+    #[error("TinyInt value {0} out of range (-16..=127)")]
     TinyIntOutOfRange(i8),
     /// Tiny container/string size exceeds 0x0F.
+    #[error("tiny size {0} out of range (0..=15)")]
     TinySizeOutOfRange(u8),
 }
-
-impl core::fmt::Display for MarkerError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            MarkerError::InvalidByte(b) => {
-                write!(f, "invalid PackStream marker: 0x{b:02X}")
-            }
-            MarkerError::TinyIntOutOfRange(v) => {
-                write!(f, "TinyInt value {v} out of range (-16..=127)")
-            }
-            MarkerError::TinySizeOutOfRange(s) => {
-                write!(f, "tiny size {s} out of range (0..=15)")
-            }
-        }
-    }
-}
-
-impl std::error::Error for MarkerError {}
 
 impl Marker {
     /// Parse a raw byte into a `Marker`.
